@@ -1,14 +1,15 @@
 name:                Marran
 version:             0.1.0.0
-github:              "Fancryer/NuML"
+github:              "Fancryer/snapshots"
 license:             BSD-3-Clause
-author:              "Alice Eve Liddell"
-maintainer:          "example@example.com"
-copyright:           "2025 Author name here"
+author:              "Fancryer"
+maintainer:          "Fancryer"
+copyright:           "2025 Fancryer"
 
 extra-source-files:
 - README.md
 - CHANGELOG.md
+- CITATION.cff
 
 # Metadata used when publishing your package
 # synopsis:            Short description of your package
@@ -17,7 +18,7 @@ extra-source-files:
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
 # common to point users to the README.md file.
-description:         Please see the README on GitHub at <https://github.com/Fancryer/NuML#readme>
+description:         Please see the README on GitHub at <https://github.com/Fancryer/snapshots#readme>
 
 dependencies:
 - base >= 4.7 && < 5

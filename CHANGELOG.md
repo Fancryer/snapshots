@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
-## 0.1.0.0 - YYYY-MM-DD
+## 0.1.0.0 - 2026-11-11
 
 - A single interpreter (`IntInterpreter`); `Interpreter` is a compatibility
   re-export. The heap, the table of copies and the table of code are

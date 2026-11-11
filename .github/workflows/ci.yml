@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: ["article-artifact", "main"]
+  pull_request:
+    branches: ["article-artifact", "main"]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: stack build / stack test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Stack
+        uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          enable-stack: true
+          stack-version: "latest"
+          stack-no-global: true
+          stack-setup-ghc: true
+
+      - name: Cache Stack root and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.stack-root }}
+            .stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('stack.yaml', 'stack.yaml.lock', 'package.yaml', 'Marran.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-stack-
+
+      - name: Build
+        run: stack build --no-terminal
+
+      - name: Test
+        run: stack test --no-terminal

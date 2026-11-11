@@ -6,22 +6,23 @@ cabal-version: 2.2
 
 name:           Marran
 version:        0.1.0.0
-description:    Please see the README on GitHub at <https://github.com/Fancryer/NuML#readme>
-homepage:       https://github.com/Fancryer/NuML#readme
-bug-reports:    https://github.com/Fancryer/NuML/issues
-author:         Alice Eve Liddell
-maintainer:     example@example.com
-copyright:      2025 Author name here
+description:    Please see the README on GitHub at <https://github.com/Fancryer/snapshots#readme>
+homepage:       https://github.com/Fancryer/snapshots#readme
+bug-reports:    https://github.com/Fancryer/snapshots/issues
+author:         Fancryer
+maintainer:     Fancryer
+copyright:      2025 Fancryer
 license:        BSD-3-Clause
 license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
     README.md
     CHANGELOG.md
+    CITATION.cff
 
 source-repository head
   type: git
-  location: https://github.com/Fancryer/NuML
+  location: https://github.com/Fancryer/snapshots
 
 library
   exposed-modules:

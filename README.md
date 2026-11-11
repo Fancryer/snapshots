@@ -47,6 +47,9 @@ stack exec marran-exe -- --bench-edges --csv bench_edges.csv
   inference (`Infer`, `Unify`, `Scope`, `Types`, `TypedIR`), the interpreter
   (`IntInterpreter`), the benchmark harness and the test driver (`Suite`).
 - `app/` — the executable (`Main.hs`) and the example programs (`app/marr`).
+  `app/marr/handle_while.marr` (effect handlers with an explicit polymorphic
+  type argument) does not type-check yet and is kept as a known-failing
+  experiment; the ten programs of Table 1 all pass.
 - `test/` — the Hspec suites.
 - `prover/marr/` — a Lean 4 development that checks the syntactic facts about
   `freeze` used by the paper (that `freeze` yields frozen terms, is the
