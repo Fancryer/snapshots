@@ -1,0 +1,8 @@
+//| imm замораживает и код функции make: счётчик становится константой. Ожидается: 0, затем 0
+funct make () : {Cell} () -> {Read; Rebind} Int =
+  var x = 0;
+  {x := + x 1; x}
+
+funct main () : {Output} () =
+  imm f = make ();
+  sayn (f ()); sayn (f ())

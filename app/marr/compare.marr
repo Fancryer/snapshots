@@ -1,0 +1,7 @@
+//| Проверка сравнений. Ожидается 5 строк: ok ok ok ok ok
+funct main () : {Output} () =
+  (if < 1 2 then sayn 'ok: 1 < 2' else sayn 'BAD: 1 < 2 is false');
+  (if < 2 1 then sayn 'BAD: 2 < 1 is true' else sayn 'ok: 2 < 1 is false');
+  (if < 2 2 then sayn 'BAD: 2 < 2 is true' else sayn 'ok: 2 < 2 is false');
+  (if > 2 1 then sayn 'ok: 2 > 1' else sayn 'BAD: 2 > 1 is false');
+  (if ieq 3 3 then sayn 'ok: 3 = 3' else sayn 'BAD: 3 = 3 is false')

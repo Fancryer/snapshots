@@ -1,0 +1,19 @@
+//| Клауза sub без resume прерывает обрабатываемое вычисление: результат add 5 (sub 3 2) равен 1, а не 6.
+//| Ожидается вывод: 1
+row Mutation = {Var; Cell; Read; Rebind}
+row Io = {Input; Output}
+row Main = {... Mutation; ... Io | `R}
+
+effect Math
+  add : Int -> Int -> Int;
+  sub : Int -> Int -> Int
+end
+
+funct main () : Main () =
+  sayn (under Math to
+    add 5 (sub 3 2)
+  handle
+  | add a b => resume + a b
+  | sub a b => - a b
+  | then s => s);
+  ()

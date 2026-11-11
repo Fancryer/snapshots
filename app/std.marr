@@ -1,0 +1,175 @@
+effect Functions
+  id      : `T -> `T;
+  const   : `A -> `B -> `A;
+  flip    : (`A -> `B -> `C) -> `B -> `A -> `C;
+  compose : (`B -> {|R} `C) -> (`A -> {|R} `B) -> `A -> `C;
+  apply   : (`A -> {|R} `B) -> `A -> {|R} `B;
+  curry   : ((`A, `B) -> {|R} `C) -> `A -> `B -> {|R} `C;
+  uncurry : (`A -> `B -> {|R} `C) -> (`A,  `B) -> {|R} `C
+end
+
+effect Numbers
+  +         : Int -> Int -> Int;
+  -         : Int -> Int -> Int;
+  *         : Int -> Int -> Int;
+  /         : Int -> Int -> {Error} Int;
+  mod       : Int -> Int -> Int;
+  neg       : Int -> Int;
+  abs       : Int -> Int;
+  max       : Int -> Int -> Int;
+  min       : Int -> Int -> Int;
+  ieq       : Int -> Int -> Boolean;
+  ineq      : Int -> Int -> Boolean;
+  ilt       : Int -> Int -> Boolean;
+  igt       : Int -> Int -> Boolean;
+  ileq      : Int -> Int -> Boolean;
+  igeq      : Int -> Int -> Boolean;
+  //| floats
+  +.        : Float -> Float -> Float;
+  -.        : Float -> Float -> Float;
+  *.        : Float -> Float -> Float;
+  /.        : Float -> Float -> Float;
+  fmod      : Float -> Float -> Float;
+  fneg      : Float -> Float;
+  fabs      : Float -> Float;
+  fmax      : Float -> Float -> Float;
+  fmin      : Float -> Float -> Float;
+  feq       : Float -> Float -> Boolean;
+  fneq      : Float -> Float -> Boolean;
+  flt       : Float -> Float -> Boolean;
+  fgt       : Float -> Float -> Boolean;
+  fleq      : Float -> Float -> Boolean;
+  fgeq      : Float -> Float -> Boolean;
+  //| conversions
+  to_int    : Float -> Int;
+  to_float  : Int -> Float;
+end
+
+val Strings = #{
+  val ++        : String -> String -> String = ...;
+  val slen      : String -> Int = ...;
+  val sub       : Int -> Int -> String = ...;
+  val split     : String -> String -> [String] = ...;
+  val join      : String -> [String] -> String = ...;
+  val trim      : String -> String = ...;
+  val upper     : String -> String = ...;
+  val lower     : String -> String = ...;
+  val contains  : String -> String -> Boolean = ...;
+  val replace   : String -> String -> String -> String = ...;
+  val seq       : String -> String -> Boolean = ...;
+  val sneq      : String -> String -> Boolean = ...
+}
+
+effect Strings
+  ++        : String -> String -> String;
+  slen      : String -> Int;
+  sub       : Int -> Int -> String;
+  split     : String -> String -> [String];
+  join      : String -> [String] -> String;
+  trim      : String -> String;
+  upper     : String -> String;
+  lower     : String -> String;
+  contains  : String -> String -> Boolean;
+  replace   : String -> String -> String -> String;
+  seq       : String -> String -> Boolean;
+  sneq      : String -> String -> Boolean;
+end
+
+effect Booleans
+  not   : Boolean -> Boolean;
+  or    : Boolean -> Boolean -> Boolean;
+  and   : Boolean -> Boolean -> Boolean;
+  xor   : Boolean -> Boolean -> Boolean;
+  nor   : Boolean -> Boolean -> Boolean;
+  nand  : Boolean -> Boolean -> Boolean
+end
+
+effect Arrays
+  head    : [`T] -> `T;
+  tail    : [`T] -> [`T];
+  empty   : [`T] -> Boolean;
+  alen    : [`T] -> Int;
+  map     : (`A -> {| R} `B) -> [`A] -> {| R} [`B];
+  filter  : ([`T] -> {| R} Boolean) -> [`T] -> {| R} [`T];
+  any     : ([`T] -> {| R} Boolean) -> [`T] -> {| R} Boolean;
+  all     : ([`T] -> {| R} Boolean) -> [`T] -> {| R} Boolean;
+  foldl   : (`B -> `A -> {| R} `B) -> `B -> [`A] -> {| R} `B;
+  foldr   : (`B -> `A -> {| R} `B) -> `B -> [`A] -> {| R} `B;
+  concat  : [[`T]] -> [`T];
+  zip     : [`A] -> [`B] -> [`A, `B];
+  at      : [`T] -> Int -> {Error} `T;
+  take    : Int -> [`T] -> [`T];
+  drop    : Int -> [`T] -> [`T]
+end
+
+effect Pairs
+  fst         : (`L, `R) -> `L;
+  snd         : (`L, `R) -> `R
+end
+
+effect Output
+  say   : `A -> {Output} ();
+  sayn  : `A -> {Output} ();
+  trace : String -> `A -> {Output} `A
+end
+
+//| pseudocode, raw bindings are not allowed in global scope
+val Output = #{
+  val say   : `A -> {Output} () = ...;
+  val sayn  : `A -> {Output} () = ...;
+  val trace : String -> `A -> {Output} `A = ...
+}
+
+funct foo () : {Output} =
+  Output@trace 'calling say from companion record' $
+    Output@say 'AbobA'
+
+effect Input
+  read_int    : () -> {Input} Int;
+  read_string : () -> {Input} String;
+  read_float  : () -> {Input} Float
+end
+
+effect Env
+  getEnv  : String -> {Env} String;
+  setEnv  : String -> String -> {Env} ()
+end
+
+effect File
+  read_file       : String -> {File} String;
+  write_file      : String -> String -> {File} ();
+  append_file     : String -> String -> {File} ();
+  file_exists     : String -> {File} Boolean;
+  delete_file     : String -> {File} ();
+  list_directory  : String -> {File} [String]
+end
+
+effect Random
+  random_int      : () -> {Random} Int;
+  random_float    : () -> {Random} Float;
+  random_boolean  : () -> {Random} Boolean;
+  random_string   : Int -> {Random} String
+end
+
+effect Time
+  time_ms : () -> {Time} Int;
+  sleep   : Int -> {Time} ()
+end
+
+effect System
+  args      : () -> {System} [String];
+  hostname  : () -> {System} String;
+  system    : String -> {System} Int;
+  exit      : Int -> {Io} Nothing
+end
+
+effect Conv
+  show  : `T -> String
+end
+
+effect Error
+  error   : String -> {Error} `A;
+  //| do -> catch -> result
+  try     : (() -> {Error | R} `A) -> (String -> {| R} `A) -> {| R}`A;
+  assert  : Boolean -> String -> {Error} ()
+end

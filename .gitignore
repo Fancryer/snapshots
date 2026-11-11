@@ -1,0 +1,9 @@
+dist-newstyle/
+.stack-work/
+*.hi
+*.o
+.VSCodeCounter/
+.vscode/
+.idea/
+*.csv
+todo.md

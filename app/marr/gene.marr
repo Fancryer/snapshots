@@ -1,0 +1,4 @@
+funct main () : {Read; Var} Int =
+  var x = 10;
+  val f = {x};
+  f ()

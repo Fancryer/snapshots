@@ -1,0 +1,6 @@
+//| Повторные вызовы одной лямбды не должны делить параметр. Ожидается: 3, затем 4, затем 3
+funct main () : {Output} () =
+  val add = {(n) = + n 1};
+  val a = add 2;
+  val b = add 3;
+  sayn a; sayn b; sayn a

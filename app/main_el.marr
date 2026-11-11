@@ -1,0 +1,4 @@
+funct apply[]{}(f : `A -> { | `R} `B) (x : `A) : { | `R} `B = f x
+funct hello[]{}(u : ()) : {Output} () = sayn 'hello'
+funct double[]{}(n : Int) : Int = + n n
+funct main[]{}(. : ()) : {Output} () = apply hello (); sayn (apply double 21)

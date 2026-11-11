@@ -1,0 +1,8 @@
+//| Счётчик без imm. Ожидается: 1, затем 2
+funct make () : {Cell} () -> {Read; Rebind} Int =
+  var x = 0;
+  {x := + x 1; x}
+
+funct main () : {Output; Cell; Read; Rebind} () =
+  val f = make ();
+  sayn (f ()); sayn (f ())

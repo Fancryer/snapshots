@@ -1,0 +1,10 @@
+name = "marr"
+version = "0.1.0"
+defaultTargets = ["marr"]
+
+[[lean_lib]]
+name = "Marr"
+
+[[lean_exe]]
+name = "marr"
+root = "Main"

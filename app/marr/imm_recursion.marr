@@ -1,0 +1,7 @@
+//| Рекурсивная функция внутри снимка (цикл в таблице копий). Ожидается: 15
+funct sum (n Int) : Int =
+  if ieq n 0 then 0 else + n (sum (- n 1))
+
+funct main () : {Output} () =
+  imm r = sum 5;
+  sayn r

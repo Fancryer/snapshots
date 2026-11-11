@@ -1,0 +1,39 @@
+row Mutation = {Var; Cell; Read; Rebind}
+row Io = {Input; Output}
+row Main = {... Mutation; ... Io | `R}
+
+effect Loop[T]
+  continue : () -> ();
+  break : `T -> ()
+end
+
+funct while (pred () -> Main Boolean) (do () -> Main ()) : Main ()
+  = if pred () then (do (); while pred do) else ()
+
+funct loop[T]
+  (pred () -> Main Boolean)
+  (do () -> {Loop[`T]; ... Main} `T)
+  (or_else `T)
+  : {Loop[`T]; ... Main} `T
+  =
+    under Loop[`T] to
+      if pred() then (do (); loop pred do) else or_else
+    handle
+    | break x => x
+    | continue c => (do (); loop pred do)
+
+effect Math
+  add : Int -> Int -> Int;
+  sub : Int -> Int -> Int
+end
+
+funct main () : Main () =
+  var x = 0;
+  loop {< x 10}
+  {
+    val y = read_int ();
+    if ieq y 5 then
+      break 7
+    else
+      x
+  }

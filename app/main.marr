@@ -1,0 +1,32 @@
+row Mutation = {Var; Cell; Read; Rebind}
+row Io = {Input; Output}
+row Main = {... Mutation; ... Io | `R}
+
+funct while (pred () -> Main Boolean) (do () -> Main ()) : Main ()
+  = if pred () then (do (); while pred do) else ()
+
+funct guess_game () : Main () =
+  val secret = random_int 1 100;
+  var attempts = 0;
+  var guessed = false;
+  
+  sayn 'Guess the number (1-100)';
+  sayn 'Enter your guess:';
+  while {not guessed}
+  {
+    val guess = force $ read_int ();
+    attempts := + 1 attempts;
+    if ieq guess secret then (
+      guessed := true;
+      say 'Correct! You took '; say attempts; sayn ' attempts.'
+    )
+    else if < guess secret then
+      sayn 'Too low!'
+    else
+      sayn 'Too high!'
+  }
+
+funct main () : Main () =
+  val add = {a b = + a b};
+  sayn $ add 5 3
+  //|force $ guess_game ()

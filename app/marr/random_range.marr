@@ -1,0 +1,4 @@
+//| Секрет должен лежать в [1, 100]. Ожидается: ok (прогоните несколько раз)
+funct main () : {Output; Random} () =
+  val s = random_int 1 100;
+  (if < s 1 then sayn 'BAD: below 1' else if > s 100 then sayn 'BAD: above 100' else sayn 'ok')

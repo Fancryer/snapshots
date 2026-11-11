@@ -1,0 +1,30 @@
+funct while
+  (pred () -> {Pred | `Row} Boolean)
+  (do () -> {Do | `Row} ())
+  : {Pred; Do | `Row} ()
+  = if pred () then while pred do else ()
+
+funct guess_game () : Main () =
+  val secret = random_int 1 100;
+  var attempts = 0;
+  var guessed = false;
+
+  sayn 'Guess the number (1-100)';
+  while {not guessed}
+  {
+    sayn 'Enter your guess: ';
+    val guess = read_int ();
+    attempts := + 1 attempts;
+    if ieq guess secret then
+    (
+      guessed := true;
+      say 'Correct! You took '; say attempts; sayn ' attempts.'
+    )
+    else if < guess secret then
+      sayn 'Too low!'
+    else
+      sayn 'Too high!'
+  }
+
+funct main () : Main () = guess_game ()
+

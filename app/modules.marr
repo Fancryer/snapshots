@@ -1,0 +1,48 @@
+module type DB[connection] =
+  query : `connection -> String -> {Read} [Row];
+  exec  : `connection -> String -> {Write} ();
+  connection : `connection
+end
+
+module type CACHE[cache] =
+  get : `cache -> String -> {Read} (Maybe[String]);
+  set : `cache -> String -> String -> {Rebind} ();
+  cache : `cache
+end
+
+//| `module val` marks module instance, type signature is mandatory in top-level
+module val FileDB : DB[String] =
+  funct query (conn String) (sql String) : {Read} [Row] = []
+  funct exec (conn String) (sql String) : {Write} () = ()
+  val connection = 'data.db'
+end
+
+module val MemCache : CACHE[Map[String; String]] =
+  funct get (c Map[String; String]) (key String) : {Read} (Maybe[String]) =
+    Map::lookup key c
+  
+  funct set (c Map[String; String]) (key String) (value String) : {Rebind} () =
+    c := Map::insert key value c; ()
+  
+  val cache = Map::empty ()
+end
+
+module type App = get_user : String -> {Read; Rebind} Row end
+
+//| `module funct` marks functor
+module funct MakeApp[db cache] (db DB[`db]) (c CACHE[`cache]) : App =
+    let state = #{db = db::connection; cache = c::cache}
+    in module val
+      funct get_user (id String) : {Read; Rebind} Row =
+        match c::get state@cache (++ 'user_' id) to
+          #Just row -> row
+          #Nothing ->
+            let row = db::query state@db (++ 'SELECT * FROM users WHERE id=' id)
+            in c::set state@cache (++ 'user_' id) row; row
+    end
+
+//| `module val` declaration can use functors even in top-level
+module val App : App = MakeApp FileDB MemCache end
+
+funct main () : {Read; Rebind} () =
+  say $ App::get_user '123'
