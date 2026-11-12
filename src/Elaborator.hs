@@ -21,7 +21,7 @@ where
 import qualified Ast
 import qualified Types
 import qualified Data.Text as T
-import Utils (uniqPreserveOrder, TextMap)
+import Utils (uniqPreserveOrder, TextMap, Pretty(..))
 import Data.Coerce (coerce)
 import Data.Text (Text)
 import Text.Printf (printf)
@@ -38,6 +38,7 @@ import Types (Mutability, Taste)
 import Data.Traversable (for)
 import Data.Maybe (fromMaybe)
 import Data.Map (Map)
+import qualified Suggest
 
 data FlatRow = FlatRow [Types.EffCons] (Maybe Taste)
 data TypeAliasDef = TypeAliasDef [Text] Ast.Typ
@@ -64,16 +65,35 @@ emptyEnv = ElabEnv
   mempty
   mempty
 
+-- | An error raised while turning the AST into the IR.
+--
+--   The elaborate is the second phase of the front end and has no more
+--   information than the AST has, so these errors carry a message and nothing
+--   else; they are rendered by the same code as the type errors.
 data ElaborationError =
   ElaborationError Text
   | UnboundVarError Text
-  deriving (Show)
+  deriving (Eq)
+
+instance Pretty ElaborationError where
+  pretty = \case
+    ElaborationError m -> m
+    UnboundVarError m -> m
+
+-- | An elaboration error is a message: rendering it with 'show' should give
+--   the text the user is meant to read, not a constructor application.
+instance Show ElaborationError where
+  show = T.unpack . pretty
 
 newtype ElabState = ElabState {_counter :: Int}
 
 makeLenses ''ElabState
 
 type ElabM a = ExceptT ElaborationError (State ElabState) a
+
+-- | Raise an elaboration error from a plain message.
+elabError :: String -> ElabM a
+elabError = throwError . ElaborationError . T.pack
 
 freshBound, freshMeta :: Text -> ElabM Taste
 freshBound name = do
@@ -151,7 +171,7 @@ collectRowEnv = foldM go []
   where
     go :: RowEnv -> Ast.TopLevelStat -> ElabM RowEnv
     go acc stat = case stat of
-      Ast.RowDef n row -> do
+      Ast.RowDef _ n row -> do
         let name = T.unpack n
         when (any ((name ==) . fst) acc) $
           throwError $ ElaborationError $ "Duplicate row definition: " <> n
@@ -163,7 +183,7 @@ collectTypEnv = foldM go []
   where
     go :: TypEnv -> Ast.TopLevelStat -> ElabM TypEnv
     go acc stat = case stat of
-      Ast.TypeDef n ts body -> do
+      Ast.TypeDef _ n ts body -> do
         let name = T.unpack n
         when (any ((name ==) . fst) acc) $
           throwError $ ElaborationError $ "Duplicate type definition: " <> n
@@ -175,18 +195,18 @@ elaborateTopLevelStat = elaborateTopLevelStat' emptyEnv
 
 elaborateTopLevelStat' :: ElabEnv -> RowEnv -> TypEnv -> Ast.TopLevelStat -> ElabM Types.TopLevelStat
 elaborateTopLevelStat' env renv tenv = \case
-  Ast.TypeDef n ts t -> do
+  Ast.TypeDef sp n ts t -> do
     ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
     let env' = extendTyp ts' env
-    Types.STypeDef n (coerce ts) <$> elaborateType' renv tenv env' [] t
-  Ast.EffectDef n ts ops -> do
+    Types.STypeDef sp n (coerce ts) <$> elaborateType' renv tenv env' [] t
+  Ast.EffectDef sp n ts ops -> do
     ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
     let env' = extendTyp ts' env
-    Types.SEffDef . Types.EffDef n (coerce ts)
+    Types.SEffDef sp . Types.EffDef n (coerce ts)
       <$> forM ops (\(Ast.EffectOp n' t) -> (n',) <$> elaborateFunct renv tenv env' t)
-  Ast.RowDef n fxs ->
-    Types.SRowDef . Types.RowDef n <$> elaborateEffRow' renv tenv env fxs
-  Ast.FunctDef n ts (Ast.EffParams es rs) args fxs t b -> do
+  Ast.RowDef sp n fxs ->
+    Types.SRowDef sp . Types.RowDef n <$> elaborateEffRow' renv tenv env fxs
+  Ast.FunctDef sp n ts (Ast.EffParams es rs) args fxs t b -> do
     ts' <- for (coerce ts) $ \nm -> (nm,) <$> freshBound nm
     es' <- for es $ \nm -> (nm,) <$> freshBound nm
     rs' <- for rs $ \nm -> (nm,) <$> freshBound nm
@@ -196,7 +216,7 @@ elaborateTopLevelStat' env renv tenv = \case
       Ast.NilArg -> pure (".", Types.TNil)
     fxs' <- for fxs $ elaborateEffRow' renv tenv env'
     t' <- elaborateType' renv tenv env' [] t
-    Types.SFunctDef . Types.FunctDecl
+    Types.SFunctDef sp . Types.FunctDecl
       n
       (coerce ts)
       es
@@ -212,10 +232,14 @@ elaborateBlock renv tenv env (Ast.Block stats e) = do
   pure (stats', e')
 
 elaborateBlockStat :: RowEnv -> TypEnv -> ElabEnv -> Ast.BlockStat -> ElabM Types.Stat
-elaborateBlockStat renv tenv env = \case
-  Ast.BExp e -> Types.Expr <$> elaborateExpr renv tenv env e
-  Ast.BAssign (Ast.Assign n e) -> Types.Assign n <$> elaborateExpr renv tenv env e
-  Ast.BBindDef (Ast.BindDef c (Ast.LambdaParam n t) e) ->
+elaborateBlockStat renv tenv env st =
+  Types.atStatSpan (Ast.bsSpan st) <$> elaborateStatNode renv tenv env (Ast.bsNode st)
+
+elaborateStatNode :: RowEnv -> TypEnv -> ElabEnv -> Ast.BlockStatNode -> ElabM Types.Stat
+elaborateStatNode renv tenv env = \case
+  Ast.BExpNode e -> Types.Expr <$> elaborateExpr renv tenv env e
+  Ast.BAssignNode (Ast.Assign n e) -> Types.Assign n <$> elaborateExpr renv tenv env e
+  Ast.BBindDefNode (Ast.BindDef c (Ast.LambdaParam n t) e) ->
     Types.Bind (elaborateMutability c) n <$> for t (elaborateType' renv tenv env []) <*> elaborateExpr renv tenv env e
 
 elaborateApply :: RowEnv -> TypEnv -> ElabEnv -> Bool -> Ast.Exp -> Ast.Exp -> ElabM Types.Expr
@@ -225,8 +249,14 @@ elaborateApply renv tenv env wrapInParens f e = do
   let e'' = if wrapInParens then Types.Paren ([], e') else e'
   pure $ Types.Apply f' e''
 
+-- | Elaborate an expression, keeping the position of its AST node.  The span of
+--   the AST node is authoritative: it is the region the user wrote.
 elaborateExpr :: RowEnv -> TypEnv -> ElabEnv -> Ast.Exp -> ElabM Types.Expr
-elaborateExpr renv tenv env = \case
+elaborateExpr renv tenv env e =
+  Types.atSpan (Ast.expSpan e) <$> elaborateNode renv tenv env e
+
+elaborateNode :: RowEnv -> TypEnv -> ElabEnv -> Ast.Exp -> ElabM Types.Expr
+elaborateNode renv tenv env = \case
   Ast.EName n -> pure $ Types.XVar n
   Ast.EApply f e -> elaborateApply renv tenv env False f e
   Ast.EDollar f e -> elaborateApply renv tenv env True f e
@@ -313,8 +343,8 @@ elaborateEffArg renv tenv env = \case
     row' <- elaborateEffRow' renv tenv env row
     case row' of
       Types.RClosed cs -> pure cs
-      Types.ROpen {} -> error "Open effect rows are not allowed in with effect arguments"
-      Types.RVar _ -> error "Bare effect row variable is not allowed in with effect arguments"
+      Types.ROpen {} -> elabError "Open effect rows are not allowed in with effect arguments"
+      Types.RVar _ -> elabError "Bare effect row variable is not allowed in with effect arguments"
 
 elaborateLetPatternRecordProp :: RowEnv -> TypEnv -> ElabEnv -> Ast.AtomLetPatternRecordProp -> ElabM Types.LetPatternRecordProp
 elaborateLetPatternRecordProp renv tenv env (Ast.AtomLetPatternRecordProp q lp alp) = do
@@ -348,7 +378,7 @@ elaborateAtomLetPattern renv tenv env = \case
   Ast.ALPParen lp ->
     case stripParenLetPattern lp of
       Ast.LPATom alp -> elaborateAtomLetPattern renv tenv env alp
-      Ast.LPParam _ -> error "Parenthesized lambda parameter is not an atomic let pattern"
+      Ast.LPParam _ -> elabError "Parenthesized lambda parameter is not an atomic let pattern"
   Ast.ALPRecord props ->
     Types.ALPRecord <$> mapM (elaborateLetPatternRecordProp renv tenv env) props
 
@@ -402,7 +432,7 @@ elaborateCurriedLambda :: RowEnv
   -> ElabM Types.Expr
 elaborateCurriedLambda renv tenv env tps eps params retT body =
   Types.XLambda <$> case params of
-    [] -> error "Lambda head must contain at least one parameter"
+    [] -> elabError "Lambda head must contain at least one parameter"
     [Ast.LambdaParam n argT] ->
       Types.Lambda
         tps
@@ -434,6 +464,11 @@ elaborateFunct renv tenv env (Ast.Funct i o fxs) =
 -- elaborateType :: RowEnv -> TypEnv -> Ast.Typ -> ElabM Types.Typ
 -- elaborateType renv tenv = elaborateType' renv tenv emptyEnv []
 
+-- | The type names the language provides by itself, used to suggest a
+--   correction when a declared name is misspelled.
+builtinTypeNames :: [Text]
+builtinTypeNames = ["Int", "Float", "Boolean", "String", "Nil", "Nothing"]
+
 elaborateType' :: RowEnv -> TypEnv -> ElabEnv -> [Text] -> Ast.Typ -> ElabM Types.Typ
 elaborateType' renv tenv env visiting = \case
   Ast.TFlat n -> case n of
@@ -448,11 +483,18 @@ elaborateType' renv tenv env visiting = \case
         Just (TypeAliasDef params _)
           | null params -> expandTypeAlias' renv tenv env visiting n (Ast.TypeApps [])
           | otherwise ->
-              error $ printf
+              elabError $ printf
                 "Type alias '%s' expects %d argument(s), but was used without any"
                 (T.unpack n)
                 (length params)
-        Nothing -> pure $ Types.TFlat n
+        Nothing -> case Suggest.typoNote (builtinTypeNames <> map (T.pack . fst) tenv) n of
+          -- A name that is one typo away from a type that exists is almost
+          -- certainly that type: silently inventing an opaque `TFlat` would
+          -- report the mistake later as a mysterious unification failure.
+          -- A name that is not close to anything stays opaque, because a
+          -- program may legitimately use a type it does not declare.
+          Just hint -> elabError $ printf "unknown type '%s'; %s" (T.unpack n) (T.unpack hint)
+          Nothing -> pure $ Types.TFlat n
   Ast.TNil -> pure Types.TNil
   Ast.TArray t -> Types.TArray <$> elaborateType' renv tenv env visiting t
   Ast.TParen t -> elaborateType' renv tenv env visiting t
@@ -490,13 +532,13 @@ elaborateType' renv tenv env visiting = \case
 
 expandTypeAlias' :: RowEnv -> TypEnv -> ElabEnv -> [Text] -> Text -> Ast.TypeApps -> ElabM Types.Typ
 expandTypeAlias' renv tenv env visiting n (Ast.TypeApps ts)
-  | n `elem` visiting = error $ "Cyclic type alias: " <> T.unpack n
+  | n `elem` visiting = elabError $ "Cyclic type alias: " <> T.unpack n
   | otherwise =
     case lookup (T.unpack n) tenv of
-      Nothing -> error $ "Unknown type alias: " <> T.unpack n
+      Nothing -> elabError $ "Unknown type alias: " <> T.unpack n
       Just (TypeAliasDef params body) ->
         if length params /= length ts then
-          error $ printf
+          elabError $ printf
             "Wrong number of type arguments for alias '%s': expected %d, got %d"
             (T.unpack n)
             (length params)
@@ -522,7 +564,7 @@ elaborateTypeArg' tenv env visiting = \case
         Just (TypeAliasDef params _)
           | null params -> expandTypeArgAlias' tenv env visiting n (Ast.TypeApps [])
           | otherwise ->
-              error $ printf
+              elabError $ printf
                 "Type alias '%s' expects %d argument(s), but was used without any"
                 (T.unpack n)
                 (length params)
@@ -546,14 +588,14 @@ elaborateTypeArg' tenv env visiting = \case
 expandTypeArgAlias' :: TypEnv -> ElabEnv -> [Text] -> Text -> Ast.TypeApps -> ElabM Types.TypeArg
 expandTypeArgAlias' tenv env visiting n (Ast.TypeApps ts)
   | n `elem` visiting =
-      error $ "Cyclic type alias: " <> T.unpack n
+      elabError $ "Cyclic type alias: " <> T.unpack n
   | otherwise =
       case lookup (T.unpack n) tenv of
         Nothing ->
-          error $ "Unknown type alias: " <> T.unpack n
+          elabError $ "Unknown type alias: " <> T.unpack n
         Just (TypeAliasDef params body) ->
           if length params /= length ts then
-            error $ printf
+            elabError $ printf
               "Wrong number of type arguments for alias '%s': expected %d, got %d"
               (T.unpack n)
               (length params)
@@ -561,7 +603,7 @@ expandTypeArgAlias' tenv env visiting n (Ast.TypeApps ts)
           else
             case typToTypeArg body of
               Left err ->
-                error $ printf
+                elabError $ printf
                   "Type alias %s is not valid in type-argument position: %s"
                   (T.unpack n)
                   err
@@ -686,10 +728,12 @@ flattenEffRow renv tenv env visiting = \case
   Ast.ERAlias n ->
     let name = T.unpack n
     in if name `elem` visiting then
-      error $ "Cyclic row alias: " <> name
+      elabError $ "Cyclic row alias: " <> name
     else
       case lookup name renv of
-        Nothing -> error $ "Unknown row alias: " <> name
+        Nothing -> case Suggest.suggestionNote (map (T.pack . fst) renv) (T.pack name) of
+          Just hint -> elabError $ "Unknown row alias: " <> name <> "; " <> T.unpack hint
+          Nothing -> elabError $ "Unknown row alias: " <> name
         Just row -> flattenEffRow renv tenv env (name : visiting) row
   Ast.ERSugar entries Nothing -> do
     foldM (\acc entry ->
@@ -734,7 +778,7 @@ mergeFlatRows (FlatRow cons1 t1) (FlatRow cons2 t2) =
     (Nothing, Nothing) -> pure $ FlatRow (cons1 <> cons2) Nothing
     (Just t, Nothing) -> pure $ FlatRow (cons1 <> cons2) (Just t)
     (Nothing, Just t) -> pure $ FlatRow (cons1 <> cons2) (Just t)
-    (Just _, Just _) -> error "Multiple effect row tails in one row"
+    (Just _, Just _) -> elabError "Multiple effect row tails in one row"
 
 elaborateEffCons :: TypEnv -> ElabEnv -> Ast.EffCons -> ElabM Types.EffCons
 elaborateEffCons tenv env = \case

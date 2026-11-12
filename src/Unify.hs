@@ -32,6 +32,7 @@ module Unify (
   addRowLacksToRow,
   TypeCheckM,
   TypeCheckError(..),
+  errorCode,
   runTypeCheckM,
   evalTypeCheckM,
   execTypeCheckM,
@@ -43,6 +44,7 @@ module Unify (
   currentLevel,
   errorStack,
   throwTypeCheckError,
+  throwTypeCheckErrorWithNotes,
   bindRowVar,
   bindEffVar
 ) where
@@ -73,15 +75,20 @@ import Data.Bifunctor (bimap)
 import Text.Printf (printf)
 import qualified Data.Text as T
 import Data.Text (Text)
-import Control.Lens (makeLenses, use, Field1 (_1), Field2 (_2), Field3 (_3), (-=), (+=), (%=))
+import Control.Lens (makeLenses, use, Field1 (_1), Field2 (_2), Field3 (_3), (-=), (+=), (%=), (.=))
 import TypedIR (Scope(..))
 import Utils (Pretty(..))
-import ErrorContext (ErrorStack, ErrorFrame)
+import ErrorContext (ErrorStack, ErrorFrame (..))
 import Data.Set (Set)
 import qualified Data.Set as Set
 
 data TypeCheckError =
   TypeError Text
+  | DuplicateDefinition Text
+  | RecordError Text
+  | HandlerError Text
+  | ApplicationError Text
+  | InferenceError Text
   | TypeArgError Text
   | TypeUnificationError Typ Typ
   | TypeArgUnificationError TypeArg TypeArg
@@ -110,10 +117,18 @@ withNewLevel action = do
   currentLevel -= 1
   pure result
 
+-- | Run an action with one more frame on the stack.  The stack is a scope, not
+--   an accumulator: on the successful path the previous stack is restored, so
+--   frames of sibling expressions never leak into one another.  On the error
+--   path the exception carries the stack as it was at 'throwTypeCheckError',
+--   which is exactly the path to the failing node.
 withErrorStack :: ErrorFrame -> TypeCheckM a -> TypeCheckM a
 withErrorStack frame action = do
-  errorStack %= (frame :)
-  action
+  saved <- use errorStack
+  errorStack .= (frame : saved)
+  result <- action
+  errorStack .= saved
+  pure result
 
 type TypeCheckM a = ExceptT (ErrorStack, TypeCheckError) (State TypeCheckState) a
 
@@ -128,6 +143,15 @@ execTypeCheckM comp = snd . runTypeCheckM comp
 
 throwTypeCheckError :: TypeCheckError -> TypeCheckM a
 throwTypeCheckError err = throwError . (, err) =<< use errorStack
+
+-- | Report an error together with notes that are not part of the frame
+--   stack: a "did you mean" suggestion, for instance.  They are carried
+--   as 'EFMessage' frames, which the renderer prints after the trace,
+--   uncapped and never merged with a neighbour.
+throwTypeCheckErrorWithNotes :: TypeCheckError -> [Text] -> TypeCheckM a
+throwTypeCheckErrorWithNotes err notes = do
+  stack <- use errorStack
+  throwError (stack <> map EFMessage notes, err)
 
 freshMetaM, freshSkolemM, freshBoundM :: TypeCheckM Taste
 freshMetaM = do
@@ -244,23 +268,23 @@ lowerRowTo target = \case
 bindMetaType :: Scope -> Taste -> Typ -> TypeCheckM Scope
 bindMetaType scope m@(Meta _ _ lvlM) t = do
   let t' = lowerTypeTo lvlM t
-  if skolemEscapesType lvlM t' then throwTypeCheckError $ TypeError "Skolem escapes type"
+  if skolemEscapesType lvlM t' then throwTypeCheckError $ InferenceError "a rigid type variable would escape its scope; add a type annotation"
   else
     pure scope{typeSubst = Map.insert m t' $ typeSubst scope}
-bindMetaType _ s@Skolem{} _ = throwTypeCheckError $ TypeError "Cannot solve a skolem variable"
+bindMetaType _ s@Skolem{} _ = throwTypeCheckError $ InferenceError "this type involves a rigid type variable and cannot be inferred; add a type annotation"
 bindMetaType _ b@Bound{} _ =
-  throwTypeCheckError $ TypeError $ "bindMetaType | Cannot solve a bound variable " <> tasteName b
+  throwTypeCheckError $ InferenceError $ "bindMetaType | Cannot solve a bound variable " <> tasteName b
 
 bindMetaTypeArg :: Scope -> Taste -> TypeArg -> TypeCheckM Scope
 bindMetaTypeArg scope m@(Meta _ _ lvlM) t = do
   let t' = lowerTypeArgTo lvlM t
   if skolemEscapesTypeArg lvlM t' then
-    throwTypeCheckError $ TypeError "Skolem escapes type arg"
+    throwTypeCheckError $ InferenceError "Skolem escapes type arg"
   else
     pure scope{typeArgSubst = Map.insert m t' $ typeArgSubst scope}
-bindMetaTypeArg _ Skolem{} _ = throwTypeCheckError $ TypeError "Cannot solve a skolem variable"
+bindMetaTypeArg _ Skolem{} _ = throwTypeCheckError $ InferenceError "Cannot solve a skolem variable"
 bindMetaTypeArg _ b@Bound{} _ =
-  throwTypeCheckError $ TypeError $ "bindMetaTypeArg | Cannot solve a bound variable " <> tasteName b
+  throwTypeCheckError $ InferenceError $ "bindMetaTypeArg | Cannot solve a bound variable " <> tasteName b
 
 bindRowVar :: Scope -> Taste -> EffRow -> TypeCheckM Scope
 bindRowVar scope m@(Meta _ _ lvlM) row = do
@@ -272,11 +296,11 @@ bindRowVar scope m@(Meta _ _ lvlM) row = do
     RVar n | n == m -> pure scope
     ROpen _ n | n == m ->
       throwTypeCheckError $
-        TypeError "Occurs check: a row variable occurs in its own binding"
+        InferenceError "Occurs check: a row variable occurs in its own binding"
 
     _ -> do
       if skolemEscapesRow lvlM row' then
-        throwTypeCheckError $ TypeError "Skolem escapes row"
+        throwTypeCheckError $ InferenceError "Skolem escapes row"
       else do
         let forbidden = Map.findWithDefault Set.empty m scope.rowLacks
         scope' <- addRowLacksToRow scope resolved forbidden
@@ -284,11 +308,11 @@ bindRowVar scope m@(Meta _ _ lvlM) row = do
 
 bindRowVar _ s@Skolem{} _ =
   throwTypeCheckError $
-    TypeError $ "Cannot solve a skolem variable " <> tasteName s
+    InferenceError $ "Cannot solve a skolem variable " <> tasteName s
 
 bindRowVar _ b@Bound{} _ =
   throwTypeCheckError $
-    TypeError $ "Cannot solve a bound variable " <> tasteName b
+    InferenceError $ "Cannot solve a bound variable " <> tasteName b
 
 bindEffVar :: Scope -> Taste -> EffCons -> TypeCheckM Scope
 bindEffVar scope m@(Meta _ _ lvlM) e = do
@@ -299,7 +323,7 @@ bindEffVar scope m@(Meta _ _ lvlM) e = do
       let lowered = lowerEffConsTo lvlM e'
           forbidden = Map.findWithDefault Set.empty m scope.effLacks
       if skolemEscapesEffCons lvlM lowered then
-        throwTypeCheckError $ TypeError "Skolem escapes eff cons"
+        throwTypeCheckError $ InferenceError "Skolem escapes eff cons"
       else do
         scope' <- case lowered of
           EVar n -> addEffLacks scope n forbidden
@@ -310,11 +334,11 @@ bindEffVar scope m@(Meta _ _ lvlM) e = do
 
 bindEffVar _ s@Skolem{} _ =
   throwTypeCheckError $
-    TypeError $ "Cannot solve a skolem variable " <> tasteName s
+    InferenceError $ "Cannot solve a skolem variable " <> tasteName s
 
 bindEffVar _ b@Bound{} _ =
   throwTypeCheckError $
-    TypeError $ "Cannot solve a bound variable " <> tasteName b
+    InferenceError $ "Cannot solve a bound variable " <> tasteName b
 
 applyTypeSubst :: Scope -> Typ -> TypeCheckM Typ
 applyTypeSubst scope = \case
@@ -443,8 +467,8 @@ subsumesEffRow scope r1 r2 = do
         then pure scope
         else throwTypeCheckError $ EffectRowsUnificationError
           (T.concat [
-            "Effects of the body are not allowed by the declared row; missing in the declaration: [",
-            T.intercalate ", " $ map pretty (cs1 \\ cs2), "]"])
+            "the body performs effects that the declared row does not allow: ",
+            T.intercalate ", " $ map pretty (cs1 \\ cs2)])
           r1' r2'
 
     -- Закрытый фактический, открытый ожидаемый: лишние эффекты уходят в хвост
@@ -466,7 +490,9 @@ subsumesEffRow scope r1 r2 = do
         let isSubset = cs1 `isSubsequenceOf` cs2
         if not isSubset then
           throwTypeCheckError $ EffectRowsUnificationError
-            "Open row has effects not present in closed row"
+            (T.concat [
+              "this effect row is open but performs effects that the required row does not allow: ",
+              T.intercalate ", " $ map pretty (cs1 \\ cs2)])
             (ROpen cs1 v1)
             (RClosed cs2)
         else
@@ -499,7 +525,9 @@ unifyClosedEffConsLists scope l1 l2
   | length l1 /= length l2 =
     throwTypeCheckError $
       EffectRowsUnificationError
-        (T.concat ["Closed eff cons lists lengths are unequal: ", pretty $ length l1, " != ", pretty $ length l2])
+        (T.concat [
+          "these two effect rows have different numbers of effects (",
+          pretty (length l1), " and ", pretty (length l2), ")"])
         (RClosed l1)
         (RClosed l2)
   | otherwise = foldM (\scope' (e1, e2) -> unifyEffCons scope' e1 e2) scope (zip l1 l2)
@@ -508,9 +536,11 @@ unifyOpenEffConsLists :: Scope -> [EffCons] -> Taste -> [EffCons] -> Taste -> Ty
 unifyOpenEffConsLists scope l1 v1 l2 v2 = do
   -- Унифицируем общие эффекты
   let commonEffects = filter (`elem` l2) l1
+  -- 'commonEffects' is a subset of 'l2' by construction, so the lookup never
+  -- fails; skipping instead of panicking keeps the checker total.
   scope' <- foldM (\sc cons1 ->
           case find (cons1 ==) l2 of
-            Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Shall not happen")
+            Nothing -> pure sc
             Just cons2 -> unifyEffCons sc cons1 cons2
         ) scope commonEffects
   unifyOpenOpen scope' l1 v1 l2 v2
@@ -529,7 +559,8 @@ unifyOpenOpen scope l1 v1 l2 v2
       if null (l1 \\ l2) && null (l2 \\ l1)
         then pure scope
         else throwTypeCheckError $ EffectRowsUnificationError
-          "Open rows with the same tail have different effects" (ROpen l1 v1) (ROpen l2 v2)
+          "these two open effect rows share a tail but disagree on their explicit effects"
+          (ROpen l1 v1) (ROpen l2 v2)
   | otherwise = do
       r <- freshMetaM
       scope1 <- bindRowVar scope v1 (mkOpenRow (l2 \\ l1) r)
@@ -547,15 +578,16 @@ unifyClosedEffRowWithOpen scope closed open v = do
   if not (null missing) then
     throwTypeCheckError $ EffectRowsUnificationError
       (T.concat [
-        "Open row has effects not present in closed row: [",
-        T.intercalate ", " $ map pretty missing, "]"])
+        "the effect row requires effects that the closed row does not provide: ",
+        T.intercalate ", " $ map pretty missing])
       (RClosed closed)
       (ROpen open v)
   else do
     -- унифицируем общие эффекты (для проверки аргументов)
+    -- 'open' is a subset of 'closed' here, checked just above.
     scope' <- foldM (\sc cons1 ->
           case find (== cons1) closed of
-            Nothing -> throwTypeCheckError $ EffectConsUnificationError cons1 (error "Should not happen")
+            Nothing -> pure sc
             Just cons2 -> unifyEffCons sc cons1 cons2
         ) scope open
     -- хвост получает остаток закрытого ряда
@@ -584,7 +616,7 @@ unifyTypeArgLists :: Scope -> [TypeArg] -> [TypeArg] -> TypeCheckM Scope
 unifyTypeArgLists scope l1 l2 =
   let s1 = length l1; s2 = length l2
   in if length l1 /= length l2 then
-    throwTypeCheckError $ TypeError $ T.pack $ printf "Effect parameter lists length mismatch: %d /= %d" s1 s2
+    throwTypeCheckError $ ApplicationError $ T.pack $ printf "Effect parameter lists length mismatch: %d /= %d" s1 s2
   else
     foldM (\scope' (t1, t2) -> unifyTypeArgs scope' t1 t2) scope (zip l1 l2)
 
@@ -660,7 +692,7 @@ checkEffectNameLacks :: Set Text -> Text -> TypeCheckM ()
 checkEffectNameLacks forbidden name =
   when (name `Set.member` forbidden) $
     throwTypeCheckError $
-      TypeError $ "Forbidden effect in constrained row: " <> name
+      InferenceError $ "Forbidden effect in constrained row: " <> name
 
 addEffLacks :: Scope -> Taste -> Set Text -> TypeCheckM Scope
 addEffLacks scope variable forbidden = do
@@ -710,21 +742,55 @@ addRowLacksToRow scope row forbidden =
           pure sc
         EVar variable -> addEffLacks sc variable forbidden
 
+-- | How an error reads in a diagnostic.  The messages are prose because they
+--   are shown to the user; the constructor names are an implementation detail
+--   of the checker.  'errorCode' supplies the stable identifier that goes in
+--   the square brackets of the header line.
 instance Pretty TypeCheckError where
   pretty = \case
-    TypeError e -> "TypeError: " <> e
-    TypeArgError e -> "TypeArgError: " <> e
+    TypeError e -> e
+    DuplicateDefinition e -> e
+    RecordError e -> e
+    HandlerError e -> e
+    ApplicationError e -> e
+    InferenceError e -> e
+    TypeArgError e -> e
     TypeUnificationError l r ->
-      T.pack $ printf "TypeUnificationError: (%s) ~ (%s)" (pretty l) (pretty r)
+      T.concat ["cannot unify the type `", pretty l, "` with the type `", pretty r, "`"]
     TypeArgUnificationError l r ->
-      T.pack $ printf "TypeArgUnificationError: (%s) ~ (%s)" (pretty l) (pretty r)
-    EffectRowsUnificationError t l r ->
-      T.pack $ printf "EffectRowsUnificationError (%s): %s ~ %s" t (pretty l) (pretty r)
+      T.concat ["cannot unify the type argument `", pretty l, "` with `", pretty r, "`"]
+    EffectRowsUnificationError t _ _ -> t
     EffectConsUnificationError l r ->
-      T.pack $ printf "EffectConsUnificationError: %s ~ %s" (pretty l) (pretty r)
-    UndefinedVariable e -> "UndefinedVariable: " <> e
-    ImmutableVariableAssignment e -> "ImmutableVariableAssignment: " <> e
-    SameScopeBindingShadowing e -> "SameScopeBindingShadowing: " <> e
-    EffectError e -> "EffectError: " <> e
-    MultipleResumeError e n -> "MultipleResumeError (" <> pretty n <> "): " <> e
-    TodoError e -> "TodoError: " <> e
+      T.concat ["cannot unify the effects `", pretty l, "` and `", pretty r, "`"]
+    UndefinedVariable e ->
+      T.concat ["`", e, "` is not in scope"]
+    ImmutableVariableAssignment e ->
+      T.concat ["cannot assign to `", e, "`, which is bound with `val` or `imm`"]
+    SameScopeBindingShadowing e ->
+      T.concat ["`", e, "` is already bound in this scope; use a different name"]
+    EffectError e -> e
+    MultipleResumeError e n ->
+      T.concat ["`", e, "` resumes ", pretty n, " times; a handler clause may resume at most once"]
+    TodoError e -> e
+
+-- | The stable code a diagnostic carries.  Users can search for it, and it
+--   does not change when the wording of the message does.
+errorCode :: TypeCheckError -> Maybe Text
+errorCode = \case
+  TypeError _ -> Just "E0001"
+  DuplicateDefinition _ -> Just "E0014"
+  RecordError _ -> Just "E0015"
+  HandlerError _ -> Just "E0016"
+  ApplicationError _ -> Just "E0017"
+  InferenceError _ -> Just "E0018"
+  TypeArgError _ -> Just "E0002"
+  TypeUnificationError _ _ -> Just "E0003"
+  TypeArgUnificationError _ _ -> Just "E0004"
+  EffectRowsUnificationError {} -> Just "E0005"
+  EffectConsUnificationError _ _ -> Just "E0006"
+  UndefinedVariable _ -> Just "E0007"
+  ImmutableVariableAssignment _ -> Just "E0008"
+  SameScopeBindingShadowing _ -> Just "E0009"
+  EffectError _ -> Just "E0010"
+  MultipleResumeError _ _ -> Just "E0011"
+  TodoError _ -> Just "E0012"

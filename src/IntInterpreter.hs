@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OrPatterns #-}
@@ -7,7 +8,7 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 
-module IntInterpreter (interpret, prepareSnapshotBenchmark) where
+module IntInterpreter (interpret, prepareSnapshotBenchmark, InterpError(..)) where
 
 import qualified TypedIR as IR
 import Types (
@@ -25,10 +26,19 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Scientific (Scientific, fromFloatDigits)
 import Control.Monad.Cont (ContT(..), callCC)
+import Control.Monad.Except (ExceptT, runExceptT, throwError)
+import Span (Span, noSpan)
 import Utils (TextMap, Pretty (..))
 import Data.Foldable (find)
 import Data.List (intercalate)
-import TypedIR (TypedExpr(..), Lambda(..), Block, TERecordProp(..))
+import TypedIR (
+    TypedExpr(..),
+    pattern TEInt, pattern TEFloat, pattern TEBoolean, pattern TEString,
+    pattern TENil, pattern TEXVar, pattern TEArray, pattern TEPair,
+    pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
+    pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
+    pattern TEPropAccess, pattern TEIfElse,
+    Lambda(..), Block, TERecordProp(..))
 import Control.Monad.State
 import Control.Monad (foldM, forM, forM_, void, replicateM, foldM_, when)
 import Infer (freezeMutability, freeze, freezeBlock, freezeLambda)
@@ -145,9 +155,7 @@ newtype Address = Address Int deriving (Ord, Eq, Show)
 instance Pretty Address where pretty (Address a) = T.pack $ printf "#%08x" a
 
 instance Stringify Address where
-  stringify a = do
-    heap <- gets sHeap
-    stringify $ derefUnsafe heap a
+  stringify a = derefOr a >>= stringify
 
 newtype EnvId = EnvId Int deriving (Ord, Eq, Show)
 instance Pretty EnvId where pretty (EnvId i) = T.pack $ printf "&%08x" i
@@ -166,7 +174,7 @@ getEnv eid = do
   st <- get
   case Map.lookup eid st.sEnvs of
     Just e -> pure e
-    Nothing -> error "invalid env"
+    Nothing -> rtError $ "internal error: environment " <> pretty eid <> " does not exist"
 
 updateEnv :: EnvId -> Env -> Interp EnvId
 updateEnv eid env = do
@@ -193,13 +201,14 @@ findBindingEnv :: EnvId -> Text -> Interp (EnvId, Mutability, Address)
 findBindingEnv eid name = go Set.empty eid
   where
     go visited eid' = do
-      when (Set.member eid' visited) $ error $ "Cyclic environment: " <> show eid'
+      when (Set.member eid' visited) $
+        rtError $ "internal error: the environment chain of " <> pretty eid' <> " is cyclic"
       env <- getEnv eid'
       case Map.lookup name env.bindings of
         Just (m,a) -> pure (eid', m, a)
         Nothing -> case env.parent of
           Just p -> go (Set.insert eid' visited) p
-          Nothing -> error $ "Unbound variable: " <> T.unpack name
+          Nothing -> rtError $ "`" <> name <> "` is not in scope"
 
 getCell :: Env -> Text -> Maybe (Mutability, Address)
 getCell e x = Map.lookup x e.bindings
@@ -218,15 +227,16 @@ derefIn a = do
   st <- get
   pure $ deref st.sHeap a
 
-derefUnsafe :: Heap -> Address -> Value
-derefUnsafe h a = case deref h a of
-  Just v -> v
-  _ -> error $ T.unpack $ "Undead address: " <> pretty a
-
-derefUnsafeIn :: Address -> Interp Value
-derefUnsafeIn a = do
+-- | Read an address that must be live.  A hole in the heap means the
+--   interpreter lost track of a value — a bug in this module, not in the
+--   program being run — so it is reported as a diagnostic instead of
+--   crashing.
+derefOr :: Address -> Interp Value
+derefOr a = do
   st <- get
-  pure $ derefUnsafe st.sHeap a
+  case deref st.sHeap a of
+    Just v -> pure v
+    Nothing -> rtError $ "internal error: address " <> pretty a <> " is not in the heap"
 
 unpackRef :: Env -> Heap -> Text -> Maybe Value
 unpackRef e h x = getRef e x >>= deref h
@@ -252,6 +262,7 @@ data InterpState = InterpState
   , sTrace      :: Bool
   , sEvents     :: Map Event Int
   , sNoMemo     :: Bool
+  , sSpan       :: Span                  -- ^ where the interpreter currently is
   }
 
 type Clause = [Address] -> (Address -> Interp Address) -> Interp Address
@@ -262,19 +273,57 @@ data HandlerFrame = HandlerFrame {
   hThen       :: Address -> Interp Address
 }
 
--- | Монада интерпретации: CPS с IO
-type Interp a = ContT Value (StateT InterpState IO) a
+-- | A failure of the interpreter itself: a value of the wrong shape reached a
+--   primitive, an address was read after it was freed, a handler went missing.
+--
+--   These are never consequences of a well-typed program, so reaching one is a
+--   bug — but a bug should be a message with a position, not an exception that
+--   unwinds through the user's screen.
+data InterpError = InterpError {
+    ieMessage :: Text
+  , ieSpan    :: Span
+  } deriving (Eq)
+
+instance Pretty InterpError where
+  pretty = ieMessage
+
+-- | 'show' is used by the few places that print a value of this type; make it
+--   print the message rather than a constructor application.
+instance Show InterpError where
+  show = T.unpack . ieMessage
+
+-- | Raise a runtime error at the node currently being evaluated.
+rtError :: Text -> Interp a
+rtError msg = do
+  sp <- gets sSpan
+  raise sp msg
+
+-- | Raise a runtime error at a known node.
+rtErrorAt :: Span -> Text -> Interp a
+rtErrorAt = raise
+
+raise :: Span -> Text -> Interp a
+raise sp msg = lift $ throwError (InterpError msg sp)
+
+-- | Mонада интерпретации: CPS с IO, ошибки — отдельный канал.
+--
+--   'ExceptT' sits under 'ContT' so that an error aborts the whole evaluation,
+--   including continuations captured by 'callCC': a runtime error is not
+--   something a handler clause may resume from.
+type Interp a = ContT Value (ExceptT InterpError (StateT InterpState IO)) a
+
+-- | Run an interpretation, keeping the final state.
+runInterp :: Interp Value -> InterpState -> IO (Either InterpError Value, InterpState)
+runInterp action = runStateT (runExceptT (runContT action pure))
 
 -- | Запуск интерпретации
-interpret :: IR.Chunk -> [String] -> IO Value
-interpret chunk cmdArgs = do
-  (result, _finalState) <- runStateT (runContT (do
-      root <- newEnv $ Env Map.empty Nothing
-      modify $ \st -> st {sEnv = root}
-      _ <- buildInitialEnv
-      evalChunk chunk
-    ) pure) initialInterpState
-  pure result
+interpret :: IR.Chunk -> [String] -> IO (Either InterpError Value)
+interpret chunk cmdArgs = fst <$> runInterp (do
+    root <- newEnv $ Env Map.empty Nothing
+    modify $ \st -> st {sEnv = root}
+    _ <- buildInitialEnv
+    evalChunk chunk
+  ) initialInterpState
 
 -- | Операция эффекта: арность и клауза объявляются вместе (единственный источник арности)
 data Op = Op {
@@ -290,39 +339,39 @@ globalOps = [
         [addrArg] -> \_ -> do
           liftIO . putStr . T.unpack =<< stringify =<< forceValue addrArg
           alloc VNil
-        _ -> error "Incorrect args amount"),
+        args -> \_ -> arityError "say" 1 args),
       ("sayn", Op 1 $ \case
         [addrArg] -> \_ -> do
           liftIO . putStrLn . T.unpack =<< stringify =<< forceValue addrArg
           alloc VNil
-        _ -> error "Incorrect args amount"),
+        args -> \_ -> arityError "sayn" 1 args),
       ("trace", Op 1 $ \case
         [addrArg] -> \_ -> do
-          st <- get
-          liftIO $ putStrLn $ T.unpack $ pretty $ derefUnsafe st.sHeap addrArg
+          v <- derefOr addrArg
+          liftIO $ putStrLn $ T.unpack $ pretty v
           pure addrArg
-        _ -> error "Incorrect args amount")
+        args -> \_ -> arityError "trace" 1 args)
     ]),
     (Eff.elabel "Input", [
       ("read_string", Op 1 $ \_ _ -> do
         input <- T.pack <$> liftIO getLine
         case Parser.parseFromText Parser.stringLiteral input of
-          Left err -> error err
+          Left _ -> rtError $ "`read_string` could not parse the line " <> quoted input
           Right s -> alloc $ VString s),
       ("read_int", Op 1 $ \_ _ -> do
         input <- T.pack <$> liftIO getLine
         case Parser.parseFromText Parser.intLiteral input of
-          Left err -> liftIO (putStrLn err) >> alloc (VInt 0)
+          Left _ -> rtError $ "`read_int` could not parse the line " <> quoted input
           Right i -> alloc $ VInt i),
       ("read_float", Op 1 $ \_ _ -> do
         input <- T.pack <$> liftIO getLine
         case Parser.parseFromText Parser.floatLiteral input of
-          Left err -> liftIO (putStrLn err) >> alloc (VFloat 0.0)
+          Left _ -> rtError $ "`read_float` could not parse the line " <> quoted input
           Right f -> alloc $ VFloat f),
       ("read_boolean", Op 1 $ \_ _ -> do
         input <- T.pack <$> liftIO getLine
         case Parser.parseFromText Parser.bool input of
-          Left err -> liftIO (putStrLn err) >> alloc (VBoolean False)
+          Left _ -> rtError $ "`read_boolean` could not parse the line " <> quoted input
           Right b -> alloc $ VBoolean b)
     ]),
     (Eff.elabel "Random", [
@@ -334,21 +383,22 @@ globalOps = [
             (VInt a, VInt b) -> do
               r <- liftIO $ toInteger <$> (randomRIO (fromIntegral a, fromIntegral b) :: IO Int)
               alloc $ VInt r
-            _ -> error "Expected Int and Int in random_int"
-        _ -> error "Incorrect args amount"),
+            _ -> rtError "`random_int` needs an Int as both its lower and upper bound"
+        args -> \_ -> arityError "random_int" 2 args),
       ("random_float", Op 1 $ \_ _ -> do
         r <- liftIO $ fromFloatDigits <$> (randomRIO (0.0, 1.0) :: IO Double)
         alloc $ VFloat r),
       ("random_boolean", Op 1 $ \_ _ -> alloc . VBoolean =<< randomIO),
       ("random_string", Op 1 $ \case
         [addr] -> \_ -> do
-          st <- get
-          r <- T.pack <$> case derefUnsafe st.sHeap addr of
-            VInt n | n <= 0 -> pure ""
-            VInt n -> map chr <$> replicateM (fromInteger n) (randomRIO (32, 126))
-            _ -> error "Not Int"
-          alloc $ VString r
-        _ -> error "Incorrect args amount")
+          v <- derefOr addr
+          case v of
+            VInt n | n <= 0 -> alloc $ VString ""
+            VInt n -> do
+              chars <- mapM (const $ chr <$> randomRIO (32, 126)) [1 .. fromInteger n]
+              alloc $ VString (T.pack chars)
+            _ -> rtError "`random_string` needs an Int as its length"
+        args -> \_ -> arityError "random_string" 1 args)
     ]),
     (Eff.elabel "Time", [
       ("time_ms", Op 1 $ \_ _ -> do
@@ -356,13 +406,49 @@ globalOps = [
         alloc $ VInt $ fromInteger $ cpuTime `div` 1_000_000_000),
       ("sleep", Op 1 $ \case
         [addr] -> \_ -> do
-          st <- get
-          case derefUnsafe st.sHeap addr of
+          v <- derefOr addr
+          case v of
             VInt i -> liftIO (threadDelay $ fromInteger i) >> alloc VNil
-            _ -> error "Not Int"
-        _ -> error "Incorrect args amount")
+            _ -> rtError "`sleep` needs an Int as its duration in microseconds"
+        args -> \_ -> arityError "sleep" 1 args)
     ])
   ]
+
+-- | The argument list of an operation whose arity is fixed did not match.
+arityError :: Text -> Int -> [Address] -> Interp a
+arityError op expected args =
+  rtError $ T.concat [
+      "`", op, "` takes ", T.pack (show expected), " argument",
+      if expected == 1 then "" else "s",
+      ", but was applied to ", T.pack (show (length args))
+    ]
+
+-- | A line of input, quoted so that trailing spaces are visible in the message.
+quoted :: Text -> Text
+quoted t = "`" <> t <> "`"
+
+-- | How a value is named in a runtime error.  The full 'Pretty' instance
+--   prints records and closures by address, which is noise in a message that
+--   only says "this was not an Int".
+describe :: Value -> Text
+describe = \case
+  VInt _ -> "an Int"
+  VFloat _ -> "a Float"
+  VBoolean _ -> "a Boolean"
+  VString _ -> "a String"
+  VNil -> "the unit value"
+  VArray _ -> "an array"
+  VPair _ _ -> "a pair"
+  VRecord _ -> "a record"
+  VClosure _ _ _ -> "a function"
+  VThunk _ _ -> "an unevaluated expression"
+  VBThunk _ _ -> "an unevaluated expression"
+  VBottom -> "an undefined value"
+
+-- | The heap has no value at this address; the interpreter itself is broken.
+undead :: Address -> Interp a
+undead addr =
+  rtError $ "internal error: address " <> pretty addr <> " is not in the heap"
 
 globalHandlers :: [HandlerFrame]
 globalHandlers = [
@@ -395,10 +481,11 @@ buildInitialEnv = do
             st'' <- get
             case deref st''.sHeap addr of
               Just (VInt i) -> pure i
-              v -> error $ "Expected Int after forcing, got " <> show v
+              Just v -> rtError $ "expected an Int, got " <> describe v
+              Nothing -> undead addr
           Just (VInt i) -> pure i
-          Nothing -> error $ T.unpack $ "Undead address in getInt: " <> pretty addr
-          Just v -> error $ "Expected Int or thunk, got " <> show v
+          Nothing -> undead addr
+          Just v -> rtError $ "expected an Int, got " <> describe v
       getBool :: Address -> Interp Bool
       getBool addr = do
         st' <- get
@@ -408,10 +495,11 @@ buildInitialEnv = do
             st'' <- get
             case deref st''.sHeap addr of
               Just (VBoolean b) -> pure b
-              v -> error $ "Expected Boolean after forcing, got " <> show v
+              Just v -> rtError $ "expected a Boolean, got " <> describe v
+              Nothing -> undead addr
           Just (VBoolean b) -> pure b
-          Nothing -> error $ T.unpack $ "Undead address in getBool: " <> pretty addr
-          Just v -> error $ "Expected Bool or thunk, got " <> show v
+          Nothing -> undead addr
+          Just v -> rtError $ "expected a Boolean, got " <> describe v
 
   let emptyCache = Just (IM.empty :: IntMap Address)
 
@@ -491,9 +579,8 @@ evalChunk chunk = do
       resultAddr <- whnfAddr resultAddr0
       reportEvents (fst $ IR.fRet mainFunct)
       traceEval $ T.unpack $ "evalChunk resultAddr: " <> pretty resultAddr
-      st' <- get
-      pure $ derefUnsafe st'.sHeap resultAddr
-    Just _ -> error "'main' is not a function definition"
+      derefOr resultAddr
+    Just _ -> rtError "'main' is not a function definition"
 
 findMain :: IR.Chunk -> Maybe IR.TopLevelStat
 findMain = find $ \case
@@ -504,7 +591,8 @@ makeTopLevelClosure :: IR.FunctDecl -> Interp (Address -> Interp Address)
 makeTopLevelClosure fd = makeClosureChain (map fst $ IR.fArgs fd) (IR.fBlock fd)
 
 makeClosureChain :: [Text] -> IR.Block -> Interp (Address -> Interp Address)
-makeClosureChain [] _ = error "Function without arguments not supported"
+makeClosureChain [] _ =
+  rtError "internal error: a top-level function was declared with no arguments"
 makeClosureChain [argName] block = pure $ \argAddr -> do
   oldEnv <- gets sEnv
   eid <- newEnv Env {
@@ -531,10 +619,20 @@ allocClosure env cache code fn = do
   modify $ \s -> s {sCode = IM.insert (addrToInt a) code s.sCode}
   pure a
 
+-- | Run an action as if the interpreter stood at this node, so that a runtime
+--   error raised inside it points at the right place.  The previous position is
+--   restored afterwards: the caller is still evaluating its own node.
+atSpan :: Span -> Interp a -> Interp a
+atSpan sp action = do
+  old <- gets sSpan
+  modify $ \s -> s {sSpan = sp}
+  result <- action
+  modify $ \s -> s {sSpan = old}
+  pure result
+
 -- | Выполнение выражения
 evalExpr :: TypedExpr -> (Address -> Interp Address) -> Interp Address
-evalExpr expr cont =
-  case expr of
+evalExpr expr cont = atSpan (teSpan expr) $ case expr of
     TEInt i -> do
       traceEval $ "evalExpr [TEInt] | " <> show i
       cont =<< alloc (VInt i)
@@ -573,13 +671,13 @@ evalExpr expr cont =
       body <- evalLambda env lam
       let cache = if isPureClosure lam.lFxs then Just IM.empty else Nothing
       cont =<< allocClosure env cache (CodeLam lam) body
-    TENLambda _ -> error "TODO"
+    TENLambda _ -> rtError "native lambdas are not implemented in the interpreter"
     TEApply f x -> do
       traceEval $ "evalExpr [TEApply] | f: " <> T.unpack (pretty f) <> ", x: " <> T.unpack (pretty x)
       fAddr <- force =<< evalExpr f pure
       xAddr <- delayArg x
-      st <- get
-      case derefUnsafe st.sHeap fAddr of
+      v <- derefOr fAddr
+      case v of
         VClosure env' (Just cache) clos -> do
           noMemo <- gets sNoMemo
           case (if noMemo then Nothing else IM.lookup (addrToInt xAddr) cache) of
@@ -606,7 +704,7 @@ evalExpr expr cont =
           result <- clos xAddr
           modify $ \s -> s {sEnv = oldEnv}
           pure result
-        _ -> error "Not a function"
+        _ -> rtError $ "the left side of an application is not a function: it is " <> describe v
     TERecord _ ps -> do
       st <- get
       when (any (\p -> p.terMut == Var) ps) $ logEvent EvCreate
@@ -618,16 +716,16 @@ evalExpr expr cont =
       cont =<< alloc (VRecord eid)
     TEPropAccess r x -> do
       rAddr <- whnf =<< evalExpr r pure
-      st <- get
-      case derefUnsafe st.sHeap rAddr of
+      v <- derefOr rAddr
+      case v of
         VRecord eid -> do
           env <- getEnv eid
           case getCell env x of
             Just (m, a) -> do
               when (m == Var) $ logEvent EvRead
               cont a
-            Nothing -> error $ concat ["Record doesn't have binding '", T.unpack x, "'"]
-        _ -> error "Not a record"
+            Nothing -> rtError $ "this record has no field `" <> x <> "`"
+        _ -> rtError $ "cannot read the field `" <> x <> "` of " <> describe v <> "; only records have fields"
     TEHandle (IR.Handler fx b clauses thenLam) _ -> do
       env <- gets sEnv
       thenFn <- evalLambda env thenLam
@@ -657,12 +755,12 @@ evalExpr expr cont =
       -- resume живёт в окружении клаузы, а вызов идёт в его потомке: ищем по цепочке
       env <- gets sEnv
       rAddr <- lookupRef env "resume"
-      rVal <- derefUnsafeIn rAddr
+      rVal <- derefOr rAddr
       case rVal of
         VClosure _ _ clos -> do
           tAddr <- evalExpr t pure
           clos tAddr
-        _ -> error "resume not in scope"
+        _ -> rtError "`resume` is not a continuation here; it may only be used inside a handler clause"
     TELet pat bound body -> do
       addr <- evalExpr bound pure
       bindings' <- matchPattern pat addr
@@ -682,7 +780,7 @@ evalExpr expr cont =
       case condVal of
         VBoolean True -> cont =<< alloc (VThunk thenExpr env)
         VBoolean False -> cont =<< alloc (VThunk elseExpr env)
-        _ -> error "Condition must be boolean"
+        _ -> rtError $ "the condition of an `if` must be a Boolean, but this one is " <> describe condVal
 
 -- | Приводит VThunk к значению и возвращает его адрес
 force :: Address -> Interp Address
@@ -699,8 +797,7 @@ force addr = do
       traceEval $ "force | resultAddr: " <> T.unpack (pretty resultAddr)
       resultAddr' <- force resultAddr
       traceEval $ "force | resultAddr': " <> T.unpack (pretty resultAddr')
-      st' <- get
-      let resultVal = derefUnsafe st'.sHeap resultAddr'
+      resultVal <- derefOr resultAddr'
       traceEval $ "force | resultVal: " <> T.unpack (pretty resultVal)
       modify $ \s -> s {sEnv = oldEnv, sHeap = IM.insert (addrToInt addr) resultVal s.sHeap}
       pure addr  -- возвращаем тот же адрес, но теперь там значение
@@ -725,7 +822,7 @@ force addr = do
     Just _ -> do
       traceEval $ "force | No need to force " <> T.unpack (pretty addr)
       pure addr
-    Nothing -> error $ T.unpack $ "force | undead address " <> pretty addr
+    Nothing -> undead addr
 
 -- | Слабая головная нормальная форма (модель: S-Expr, E-Prop): thunk вычисляется до
 --   значения, компоненты записей, массивов и пар остаются ленивыми (в отличие от force)
@@ -740,12 +837,11 @@ whnf addr = do
         TEParen b -> evalBlock b pure
         _ -> evalExpr expr pure
       resultAddr' <- whnf resultAddr
-      st' <- get
-      let resultVal = derefUnsafe st'.sHeap resultAddr'
+      resultVal <- derefOr resultAddr'
       modify $ \s -> s {sEnv = oldEnv, sHeap = IM.insert (addrToInt addr) resultVal s.sHeap}
       pure addr
     Just _ -> pure addr
-    Nothing -> error $ T.unpack $ "whnf | undead address " <> pretty addr
+    Nothing -> undead addr
 
 -- | Приводит VThunk к значению и возвращает само значение
 forceValue :: Address -> Interp Value
@@ -757,14 +853,13 @@ forceValue addr = do
       oldEnv <- gets sEnv
       modify $ \s -> s {sEnv = env'}
       resultAddr <- force =<< evalExpr expr pure
-      st' <- get
-      let resultVal = derefUnsafe st'.sHeap resultAddr
+      resultVal <- derefOr resultAddr
       modify $ \s -> s {sEnv = oldEnv, sHeap = IM.insert (addrToInt addr) resultVal s.sHeap}
       pure resultVal
     Just v -> do
       traceEval $ "forceValue | No need to force " <> T.unpack (pretty addr)
       pure v
-    Nothing -> error $ T.unpack $ "forceValue | undead address " <> pretty addr
+    Nothing -> undead addr
 
 callEffect :: ECons -> Text -> [Address] -> Interp Address
 callEffect eff opName args = do
@@ -777,8 +872,16 @@ callEffect eff opName args = do
       Just handler -> do
         case Map.lookup opName handler.hClauses of
           Just clauseFn -> clauseFn args k
-          Nothing -> error $ "Operation '" <> T.unpack opName <> "' not found in handler for " <> T.unpack (pretty eff)
-      Nothing -> error $ "No handler for effect " <> T.unpack (pretty eff)
+          Nothing -> rtError $ T.concat [
+              "the handler for `", effectName eff, "` does not handle `", opName, "`"
+            ]
+      Nothing -> rtError $ T.concat [
+          "there is no handler for the effect `", effectName eff, "` in scope"
+        ]
+
+-- | The name of an effect, without its type arguments.
+effectName :: ECons -> Text
+effectName (ECons n _) = n
 
 evalLambda :: EnvId -> IR.Lambda -> Interp (Address -> Interp Address)
 evalLambda eid lam =
@@ -840,15 +943,15 @@ applyMany :: (Address -> Interp Address) -> EnvId -> IntMap Address -> [Address]
 applyMany clos eid cache args = do
   traceEval $ "applyMany: args = " <> show args
   case args of
-    [] -> error "empty argument list"
+    [] -> rtError "internal error: a handler clause was applied to no arguments"
     [x] -> applyClos x clos eid cache
     (x:xs) -> do
       addr <- clos x
-      st <- get
-      case derefUnsafe st.sHeap addr of
+      v <- derefOr addr
+      case v of
         VClosure eid' (Just cache') next -> applyMany next eid' cache' xs
         VClosure eid' _ next -> applyMany next eid' IM.empty xs
-        _ -> error "expected closure"
+        _ -> rtError $ "a handler clause returned " <> describe v <> " instead of a function"
   where
     applyClos :: Address -> (Address -> Interp Address) -> EnvId -> IntMap Address -> Interp Address
     applyClos xAddr cl eid' cache' =
@@ -908,7 +1011,7 @@ whnfAddr :: Address -> Interp Address
 whnfAddr = whnf
 
 evalStat :: IR.Stat -> Interp ()
-evalStat stat = case stat of
+evalStat stat = atSpan (IR.tStatSpan stat) $ case stat of
   IR.Bind m n t -> do
     eid <- gets sEnv
     case m of
@@ -923,7 +1026,9 @@ evalStat stat = case stat of
     m <- lookupMut env n
     case m of
       Var -> void $ rebind n t
-      _ -> error $ "Cannot assign to non-var binding: " <> T.unpack (pretty m)
+      _ -> rtError $ T.concat [
+          "cannot assign to `", n, "`: it is bound with `", pretty m, "`"
+        ]
   IR.Expr t -> do
     -- модель (S-Expr): оператор-выражение вычисляется до слабой головной нормальной формы;
     -- иначе эффекты в отложенных ветках if и в скобках (...) никогда не выполнятся
@@ -1000,7 +1105,7 @@ freezeCell a = do
       st <- get
       v <- case IM.lookup (addrToInt a) st.sHeap of
         Just v0 -> pure v0
-        Nothing -> error $ T.unpack $ "Undead address in freezeCell: " <> pretty a
+        Nothing -> undead a
       case v of
         VClosure env cache _ ->
           case IM.lookup (addrToInt a) st.sCode of
@@ -1070,7 +1175,9 @@ rebind x t = do
       _ <- modifyEnv ex $ \env -> env {bindings = Map.insert x (Var, addr') env.bindings}
       logEvent EvRebind
       pure addr'
-    _ -> error $ concat ["Cannot rebind '", T.unpack x, "': it's ", T.unpack $ pretty m]
+    _ -> rtError $ T.concat [
+        "cannot assign to `", x, "`: it is bound with `", pretty m, "`"
+      ]
 
 allocIn :: InterpState -> Value -> (InterpState, Address)
 allocIn st v =
@@ -1167,13 +1274,6 @@ lookupRef eid name = do
   (_, _, a) <- findBindingEnv eid name
   pure a
 
--- | Поиск переменной в окружении
-lookupVar :: Env -> Heap -> Text -> Value
-lookupVar e h name =
-  case unpackRef e h name of
-    Just v -> v
-    Nothing -> error $ "Unbound variable: " <> T.unpack name
-
 lookupMut :: EnvId -> Text -> Interp Mutability
 lookupMut e name = do
   (_, m, _) <- findBindingEnv e name
@@ -1245,32 +1345,30 @@ atomLetPatternVars = \case
 
 matchPattern :: LetPattern -> Address -> Interp [(Text, Mutability, Address)]
 matchPattern pat addr = do
-  st <- get
-  case deref st.sHeap addr of
-    Just v -> case pat of
-      LPATom (ALPUnderscore; ALPNil) -> pure []
-      LPATom (ALPPair l r) -> case v of
-        VPair addrL addrR -> do
-          bindL <- matchPattern l addrL
-          bindR <- matchPattern r addrR
-          pure (bindL <> bindR)
-        _ -> error "Let pattern mismatch: expected pair"
-      LPATom (ALPRecord props) -> case v of
-        VRecord eid -> do
-          env <- getEnv eid
-          foldM (\acc (LetPatternRecordProp m (LambdaParam n _) mPat) -> do
-              case getRef env n of
-                Just fieldAddr -> do
-                  case mPat of
-                    Nothing -> pure $ (n, m, fieldAddr) : acc
-                    Just subPat -> do
-                      subBindings <- matchPattern (LPATom subPat) fieldAddr
-                      pure $ acc <> subBindings
-                Nothing -> error $ "Record missing field: " <> show n
-            ) [] props
-        _ -> error "Let pattern mismatch: expected record"
-      LPParam (LambdaParam n _) -> pure [(n, Val, addr)]
-    _ -> error "Undead address in let pattern"
+  v <- derefOr addr
+  case pat of
+    LPATom (ALPUnderscore; ALPNil) -> pure []
+    LPATom (ALPPair l r) -> case v of
+      VPair addrL addrR -> do
+        bindL <- matchPattern l addrL
+        bindR <- matchPattern r addrR
+        pure (bindL <> bindR)
+      _ -> rtError $ "this pattern expects a pair, but the value is " <> describe v
+    LPATom (ALPRecord props) -> case v of
+      VRecord eid -> do
+        env <- getEnv eid
+        foldM (\acc (LetPatternRecordProp m (LambdaParam n _) mPat) -> do
+            case getRef env n of
+              Just fieldAddr -> do
+                case mPat of
+                  Nothing -> pure $ (n, m, fieldAddr) : acc
+                  Just subPat -> do
+                    subBindings <- matchPattern (LPATom subPat) fieldAddr
+                    pure $ acc <> subBindings
+              Nothing -> rtError $ "this pattern names the field `" <> n <> "`, which the record does not have"
+          ) [] props
+      _ -> rtError $ "this pattern expects a record, but the value is " <> describe v
+    LPParam (LambdaParam n _) -> pure [(n, Val, addr)]
 
 isImmutableValue :: Heap -> Value -> Interp Bool
 isImmutableValue heap v = evalStateT (go v) IntMap.empty
@@ -1325,7 +1423,8 @@ initialInterpState = InterpState {
   sFreezeMemo = IM.empty,
   sTrace      = False,
   sEvents     = Map.empty,
-  sNoMemo     = False
+  sNoMemo     = False,
+  sSpan       = noSpan
 }
 
 prepareSnapshotBenchmark :: Int -> [(Int, Int)] -> IO (IO (Int, Int, Int))
@@ -1340,38 +1439,41 @@ prepareSnapshotBenchmark rootNode graphEdges = do
       nodeCount = maximum allNodes + 1
       adjacency = Map.fromListWith (<>) [(from, [to]) | (from, to) <- graphEdges]
 
-  -- Build the graph exactly once.
-  (_, initialState) <-
-    runStateT
-      (runContT
-        (do
-          root <- newEnv $ Env Map.empty Nothing
-          modify $ \st -> st {sEnv = root}
+  -- Build the graph exactly once.  Building it cannot legitimately fail, so a
+  -- runtime error here is a bug in the interpreter and is raised as an
+  -- exception rather than turned into a benchmark result.
+  (built, initialState) <-
+    runInterp
+      (do
+        root <- newEnv $ Env Map.empty Nothing
+        modify $ \st -> st {sEnv = root}
 
-          -- Allocate all vertices before connecting them.
-          -- This allows arbitrary sharing and forward references.
-          addresses <- mapM (const $ alloc VBottom) [0 .. nodeCount - 1]
-          let addressMap = Map.fromList (zip [0 ..] addresses)
+        -- Allocate all vertices before connecting them.
+        -- This allows arbitrary sharing and forward references.
+        addresses <- mapM (const $ alloc VBottom) [0 .. nodeCount - 1]
+        let addressMap = Map.fromList (zip [0 ..] addresses)
 
-          -- Fill every vertex with its outgoing references.
-          forM_ [0 .. nodeCount - 1] $ \node -> do
-            let children = Map.findWithDefault [] node adjacency
-                childAddresses = map (addressMap Map.!) children
-                nodeAddress = addressMap Map.! node
-            modify $ \st -> st {
-              sHeap = IM.insert (addrToInt nodeAddress) (VArray childAddresses) st.sHeap
-            }
-
-          -- Expose the selected root through the root environment.
-          let rootAddress = addressMap Map.! rootNode
-          _ <- modifyEnv root $ \env -> env {
-            bindings = Map.insert "root" (Val, rootAddress) env.bindings
+        -- Fill every vertex with its outgoing references.
+        forM_ [0 .. nodeCount - 1] $ \node -> do
+          let children = Map.findWithDefault [] node adjacency
+              childAddresses = map (addressMap Map.!) children
+              nodeAddress = addressMap Map.! node
+          modify $ \st -> st {
+            sHeap = IM.insert (addrToInt nodeAddress) (VArray childAddresses) st.sHeap
           }
-          pure VNil
-        )
-        pure
+
+        -- Expose the selected root through the root environment.
+        let rootAddress = addressMap Map.! rootNode
+        _ <- modifyEnv root $ \env -> env {
+          bindings = Map.insert "root" (Val, rootAddress) env.bindings
+        }
+        pure VNil
       )
       initialInterpState
+
+  case built of
+    Left err -> ioError $ userError $ T.unpack $ "Snapshot graph: " <> pretty err
+    Right _ -> pure ()
 
   let rootEnv = initialState.sEnv
       initialAddr = initialState.sNextAddr
@@ -1379,10 +1481,12 @@ prepareSnapshotBenchmark rootNode graphEdges = do
 
   -- This action always starts from the same pristine state.
   let runSnapshot = do
-        (_, finalState) <-
-          runStateT
-            (runContT (snapshotEnv rootEnv (Set.singleton "root") >> pure VNil) pure)
-            initialState
+        (res, finalState) <-
+          runInterp (snapshotEnv rootEnv (Set.singleton "root") >> pure VNil) initialState
+
+        case res of
+          Left err -> ioError $ userError $ T.unpack $ "Snapshot traversal: " <> pretty err
+          Right _ -> pure ()
 
         let visited = IM.size finalState.sFreezeMemo
             allocated = finalState.sNextAddr - initialAddr

@@ -2,7 +2,7 @@
 module ExamplesSpec (eSpec) where
 
 import Control.Monad (forM_)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import System.Environment (setEnv)
 import Test.Hspec
 
@@ -28,8 +28,20 @@ eSpec = beforeAll_ (setEnv "MARRAN_CHECK_EVENTS" "1") $ describe "example progra
   it (rejectedProgram ++ " is rejected with the missing Read effect") $ do
     r <- runProgram rejectedProgram
     case r of
-      Left err -> err `shouldSatisfy` ("Read" `isInfixOf`)
+      Left err -> do
+        err `shouldSatisfy` ("Read" `isInfixOf`)
+        -- The diagnostic must look like a diagnostic: a coded header, then a
+        -- location, then the source line and a caret run.
+        let ls = lines err
+        ls `shouldSatisfy` (not . null)
+        head ls `shouldSatisfy` isCodedHeader
+        ls `shouldSatisfy` any (" --> " `isPrefixOf`)
+        ls `shouldSatisfy` any ("^" `isInfixOf`)
       Right out -> expectationFailure $
         "expected a type error, got output: " ++ take 300 out
   where
     isReport l = "EVENTS:" `isInfixOf` l || "EVENT-VIOLATION" `isInfixOf` l
+    isCodedHeader l =
+      case words l of
+        (w:_) -> "error[" `isPrefixOf` w
+        [] -> False

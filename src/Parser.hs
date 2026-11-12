@@ -6,6 +6,8 @@
 {-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Parser(
@@ -15,6 +17,16 @@ module Parser(
   parseTokensUnposed,
   parseTok,
   parseFromText,
+  parseFromTextNamed,
+  parseTokensNamed,
+  parseTokNamed,
+  ParseErrorInfo(..),
+  parseDiagnostic,
+  parseErrorInfo,
+  renderParseError,
+  renderParseErrorIn,
+  sourceMapFor,
+  currentPos,
   Parser.exp,
   letExp,
   number,
@@ -39,7 +51,6 @@ import Data.Text(Text)
 
 import Text.Megaparsec(
     Parsec,
-    errorBundlePretty,
     runParser,
     many,
     MonadParsec (eof, try, lookAhead, notFollowedBy),
@@ -51,10 +62,29 @@ import Text.Megaparsec(
     (<|>),
     satisfy,
     between,
-    VisualStream (showTokens),
+    VisualStream (showTokens, tokensLength),
     TraversableStream (reachOffset),
-    manyTill,
-    anySingle, PosState (pstateInput, pstateSourcePos, pstateOffset)
+    PosState (pstateInput, pstateSourcePos, pstateOffset),
+    getParserState, updateParserState,
+    State (stateInput, statePosState), PosState (pstateSourcePos),
+    SourcePos(..), mkPos, unPos
+  )
+import Text.Megaparsec.Error (
+    ParseErrorBundle,
+    ParseError(..),
+    ErrorItem(..),
+    ErrorFancy(..),
+    ShowErrorComponent(..),
+    bundleErrors,
+    bundlePosState,
+    errorOffset
+  )
+import qualified Data.List.NonEmpty as NE
+import qualified Data.Set as Set
+import qualified Text.Megaparsec.Stream as MP
+import ErrorContext (
+    Diagnostic(..), diagnostic, primaryLabel, renderDiagnostic,
+    Severity(SevError), SourceMap, emptySourceMap, insertSource
   )
 import Lexer (
     Token (..),
@@ -65,14 +95,127 @@ import Data.Scientific (Scientific)
 import Data.Maybe (fromMaybe, isJust, fromJust)
 import Control.Monad.Combinators.Expr (makeExprParser, Operator (InfixR, Postfix, Prefix, InfixL))
 import Data.Functor (($>), void)
+import Span (Span(..), mergeSpan)
 import Ast
 import Control.Monad (MonadPlus)
-import Text.Megaparsec.Stream (VisualStream(tokensLength))
 import qualified Data.Text as T
 import Utils (Pretty(pretty))
 import Data.Foldable (toList)
 
 type Parser = Parsec Void [LToken]
+
+-- | A parse failure, described the way the renderer wants it: a one-line
+--   message, the region of the source it is about, and any extra notes.
+data ParseErrorInfo = ParseErrorInfo {
+    peMessage :: Text
+  , peSpan    :: Span
+  , peNotes   :: [Text]
+  } deriving (Eq, Show)
+
+-- | How one token of the grammar is shown in a message.  Quotes keep a token
+--   from blending into the surrounding prose.
+renderLToken :: LToken -> Text
+renderLToken = pretty . ltToken
+
+-- | The code every syntax error carries.
+syntaxErrorCode :: Text
+syntaxErrorCode = "E0013"
+
+-- | Turn a parse failure into a 'Diagnostic'.  The caller supplies the source
+--   map, because only it knows the text of the file; without one the renderer
+--   still prints the header and the location.
+parseDiagnostic :: ParseErrorInfo -> Diagnostic
+parseDiagnostic e =
+  (diagnostic SevError (Just syntaxErrorCode) (peMessage e)) {
+      diagLabels = [primaryLabel (peSpan e) ""]
+    , diagNotes  = peNotes e
+    }
+
+-- | Render a parse failure with no source to quote.
+renderParseError :: ParseErrorInfo -> Text
+renderParseError = renderDiagnostic emptySourceMap . parseDiagnostic
+
+-- | Describe the first error of a Megaparsec bundle.
+--
+--   Megaparsec reports an offset into the stream; 'reachOffset' turns it into
+--   a position, which becomes the start of the span.  The width of the
+--   offending chunk gives the span its extent, so the caret run covers the
+--   token rather than a single character.
+--
+--   The two stages of the front end have different token types (the lexer
+--   reads characters, the grammar reads 'LToken's), so the caller supplies the
+--   rendering of a token: that is the only thing the description needs.
+fromBundle ::
+     forall s e.
+     (VisualStream s, TraversableStream s, ShowErrorComponent e)
+  => (MP.Token s -> Text) -> FilePath -> ParseErrorBundle s e -> ParseErrorInfo
+fromBundle renderToken file bundle =
+  ParseErrorInfo {peMessage = message, peSpan = span', peNotes = []}
+  where
+    err    = NE.head (bundleErrors bundle)
+    offset = errorOffset err
+    (_, st) = reachOffset offset (bundlePosState bundle)
+    pos    = pstateSourcePos st
+    line   = unPos (sourceLine pos)
+    column = unPos (sourceColumn pos)
+    fileName = sourceName pos
+    span'  = Span
+      { spanFile        = T.pack (if null fileName then file else fileName)
+      , spanStartLine   = line
+      , spanStartColumn = column
+      , spanEndLine     = line
+      , spanEndColumn   = column + width
+      }
+
+    (message, width) = case err of
+      TrivialError _ item expected ->
+        let (found, w) = case item of
+              Nothing         -> ("the input ends unexpectedly", 1)
+              Just (Tokens ts) -> ("unexpected `" <> renderChunk ts <> "`", chunkWidth ts)
+              Just (Label l)   -> ("unexpected " <> T.pack (NE.toList l), 1)
+              Just EndOfInput  -> ("unexpected end of input", 1)
+            -- At end of input Megaparsec says it expected "end of input",
+            -- which repeats what was just said.
+            expected' = [ described
+                        | x <- Set.toList expected
+                        , let described = describeItem x
+                        , not (isEmpty item && described == "end of input")
+                        ]
+        in (found <> expectedText expected', w)
+      FancyError _ xs ->
+        (T.intercalate "; " (map describeFancy (Set.toList xs)), 1)
+
+    renderChunk :: NE.NonEmpty (MP.Token s) -> Text
+    renderChunk = T.concat . map renderToken . NE.toList
+
+    chunkWidth :: NE.NonEmpty (MP.Token s) -> Int
+    chunkWidth ts = max 1 (sum (map (T.length . renderToken) (NE.toList ts)))
+
+    describeItem = \case
+      Tokens ts   -> "`" <> renderChunk ts <> "`"
+      Label l     -> T.pack (NE.toList l)
+      EndOfInput  -> "end of input"
+
+    isEmpty :: Maybe a -> Bool
+    isEmpty Nothing  = True
+    isEmpty (Just _) = False
+
+    describeFancy :: ErrorFancy e -> Text
+    describeFancy = \case
+      ErrorFail m           -> T.pack m
+      ErrorCustom custom    -> T.pack (showErrorComponent custom)
+      ErrorIndentation {}   -> "the indentation is not a multiple of the tab width"
+
+-- | @; expected a, b, c@, with a cap so that a parser with many alternatives
+--   does not produce a wall of text.
+expectedText :: [Text] -> Text
+expectedText [] = ""
+expectedText xs =
+  "; expected " <> T.intercalate ", " shown
+    <> if hidden == 0 then "" else ", or " <> T.pack (show hidden) <> " more"
+  where
+    shown  = take 4 xs
+    hidden = length xs - length shown
 
 instance VisualStream [LToken] where
   showTokens _ = T.unpack . mconcat . map (pretty . ltToken) . toList
@@ -92,35 +235,143 @@ instance TraversableStream [LToken] where
     in (Nothing, posState')
 
 parseTokens :: Text -> Either String [LToken]
-parseTokens input = case runParser tokens "<test>" input of
-  Left err -> Left $ errorBundlePretty err
-  Right ts -> Right ts
+parseTokens input = parseTokensNamed "<test>" input
 
 parseTokensUnposed :: Text -> Either String [Token]
-parseTokensUnposed input = case runParser tokens "<test>" input of
-  Left err -> Left $ errorBundlePretty err
-  Right ts -> Right $ map ltToken ts
+parseTokensUnposed input = map ltToken <$> parseTokensNamed "<test>" input
 
 parseExp :: [LToken] -> Either String Exp
 parseExp input = case runParser Parser.exp "<exp>" input of
-  Left err -> Left $ errorBundlePretty err
+  Left err -> Left . T.unpack $ renderParseError $ fromBundle renderLToken "<exp>" err
   Right e -> Right e
 
+-- | Parse a stream of tokens that has already been produced.  The tokens carry
+--   their own positions, so the error already knows where it is; @file@ is only
+--   used when the stream is empty.
 parseTok :: Parser a -> [LToken] -> Either String a
-parseTok p toks =
-  case runParser (p <* eof) "" toks of
-    Left err -> Left $ errorBundlePretty err
-    Right e -> Right e
+parseTok = parseTokNamed ""
 
 parseFromText :: Parser a -> Text -> Either String a
-parseFromText parser txt = do
-  case parseTokens txt of
+parseFromText = parseFromTextNamed "<test>"
+
+-- | Like 'parseFromText', but records the given name in every 'Span'.
+parseFromTextNamed :: FilePath -> Parser a -> Text -> Either String a
+parseFromTextNamed file parser txt = do
+  let sources = sourceMapFor file txt
+  case parseTokensIn sources file txt of
     Left err -> Left err
-    Right ts -> do parseTok parser ts
+    Right ts -> parseTokIn sources file parser ts
+
+parseTokensNamed :: FilePath -> Text -> Either String [LToken]
+parseTokensNamed file input = parseTokensIn (sourceMapFor file input) file input
+
+-- | The lexer stage, rendered against the source text it is lexing.
+parseTokensIn :: SourceMap -> FilePath -> Text -> Either String [LToken]
+parseTokensIn sources file input = case runParser tokens file input of
+  Left err -> Left . T.unpack $ renderParseErrorIn sources $
+    fromBundle T.singleton file err
+  Right ts -> Right ts
+
+parseTokNamed :: FilePath -> Parser a -> [LToken] -> Either String a
+parseTokNamed = parseTokIn emptySourceMap
+
+-- | The grammar stage.  @sources@ is what lets the error quote the offending
+--   line; the spans themselves come from the tokens, which carry positions.
+parseTokIn :: SourceMap -> FilePath -> Parser a -> [LToken] -> Either String a
+parseTokIn sources file p toks =
+  case runParser (p <* eof) file toks of
+    Left err -> Left . T.unpack $ renderParseErrorIn sources $
+      fromBundle renderLToken file err
+    Right e -> Right e
+
+-- | The same failures as 'renderParseError', but with the source text
+--   available so that the offending line is quoted under the carets.
+renderParseErrorIn :: SourceMap -> ParseErrorInfo -> Text
+renderParseErrorIn sources = renderDiagnostic sources . parseDiagnostic
+
+-- | Expose the structured form of a parse failure, for callers that own a
+--   source map and want to render it themselves.
+parseErrorInfo ::
+     (VisualStream s, TraversableStream s, ShowErrorComponent e)
+  => (MP.Token s -> Text) -> FilePath -> ParseErrorBundle s e -> ParseErrorInfo
+parseErrorInfo = fromBundle
+
+-- | Build a source map with one file in it, which is what a caller needs in
+--   order to render a diagnostic that points into that file.
+sourceMapFor :: FilePath -> Text -> SourceMap
+sourceMapFor file contents = insertSource (T.pack file) contents emptySourceMap
+
+-- | The end of the last consumed token.  Megaparsec does not maintain this,
+--   so 'tok' records it: every consumed token sets 'pstateSourcePos' to the
+--   position just after itself.
+lastConsumedEnd :: Parser SourcePos
+lastConsumedEnd = pstateSourcePos . statePosState <$> getParserState
+
+-- | The position of the next token, or the end of the last consumed one at
+--   end of input.  Every token carries its own position, so the token stream
+--   is the reliable source here.
+currentPos :: Parser SourcePos
+currentPos = do
+  st <- getParserState
+  pure $ case stateInput st of
+    (LToken p _ : _) -> p
+    [] -> pstateSourcePos (statePosState st)
+
+-- | A span from the first position to the second; the two are ordered so that
+--   the result is never empty in the wrong direction.
+spanFromPositions :: SourcePos -> SourcePos -> Span
+spanFromPositions a b =
+  Span {
+    spanFile        = T.pack (sourceName a)
+  , spanStartLine   = min (unPos $ sourceLine a) (unPos $ sourceLine b)
+  , spanStartColumn = if la <= lb then ca else cb
+  , spanEndLine     = max la lb
+  , spanEndColumn   = if la >= lb then ca else cb
+  }
+  where
+    la = unPos $ sourceLine a
+    ca = unPos $ sourceColumn a
+    lb = unPos $ sourceLine b
+    cb = unPos $ sourceColumn b
+
+-- | Extend a span up to the current position.
+spanUpToHere :: Span -> Parser Span
+spanUpToHere start = do
+  end <- currentPos
+  pure $ mergeSpan start (spanFromPositions end end)
+
+-- | Run a node parser and attach the span covering exactly what it consumed.
+loc :: Parser ExpNode -> Parser Exp
+loc p = do
+  start <- currentPos
+  n <- p
+  span' <- spanUpToHere (spanFromPositions start start)
+  pure $ Exp span' n
+
+-- | Attach a node to a span that already starts at the right place.
+withSpanFrom :: Span -> ExpNode -> Parser Exp
+withSpanFrom start n = Exp <$> spanUpToHere start <*> pure n
+
+-- | Run a statement parser and attach the span covering exactly what it
+--   consumed.  Statements carry their own position so that errors about the
+--   statement as a whole (not about a subexpression) can point at the line.
+locStat :: Parser BlockStatNode -> Parser BlockStat
+locStat p = do
+  start <- currentPos
+  n <- p
+  span' <- spanUpToHere (spanFromPositions start start)
+  pure $ BlockStat span' n
 
 tok :: (Token -> Maybe a) -> Parser a
 tok f = do
-  LToken _ t <- satisfy (isJust . f . ltToken)
+  LToken p t <- satisfy (isJust . f . ltToken)
+  -- Record where this token ends, so that a node ending at end of input still
+  -- gets a non-empty span.  Tokens never span lines.
+  updateParserState $ \st -> st {
+      statePosState = (statePosState st) {
+        pstateSourcePos = p {sourceColumn = mkPos (unPos (sourceColumn p) + T.length (pretty t))}
+      }
+    }
   pure $ fromJust $ f t
   -- satisfyMap
   -- where
@@ -213,16 +464,27 @@ chunk :: Parser Chunk
 chunk = Chunk <$> many topLevelStat <* eof
 
 topLevelStat :: Parser TopLevelStat
-topLevelStat = choice [typeDef, effDef, rowDef, functDef]
+topLevelStat = locTop $ choice [typeDef, effDef, rowDef, functDef]
 
-typeDef :: Parser TopLevelStat
+-- | Run a declaration parser and give the result the span it covers.  The
+--   declaration parsers build their node without a position, so the start is
+--   recorded here once instead of in each of them.
+locTop :: Parser (Span -> TopLevelStat) -> Parser TopLevelStat
+locTop p = do
+  start <- currentPos
+  mk <- p
+  sp <- spanUpToHere (spanFromPositions start start)
+  pure $ mk sp
+
+typeDef :: Parser (Span -> TopLevelStat)
 typeDef = do
   keyword KWType
   n <- name
   ts <- fromMaybe mempty <$> optional typeParams
   -- es <- fromMaybe mempty <$> optional effParams
   symbol TAssign
-  TypeDef n ts <$> typ
+  t <- typ
+  pure $ \sp -> TypeDef sp n ts t
 
 typeParams :: Parser TypeParams
 typeParams = TypeParams <$> brackets (some name)
@@ -336,14 +598,14 @@ nil = do
   symbol TParenR
   pure ()
 
-effDef :: Parser TopLevelStat
+effDef :: Parser (Span -> TopLevelStat)
 effDef = do
   keyword KWEffect
   n <- name
   ts <- fromMaybe mempty <$> optional typeParams
   ops <- sepBy effectOp semisym
   keyword KWEnd
-  pure $ EffectDef n ts ops
+  pure $ \sp -> EffectDef sp n ts ops
 
 effectOp :: Parser EffectOp
 effectOp = EffectOp <$> name <* colonsym <*> effectOpType
@@ -362,14 +624,15 @@ effectOpType = do
         pure $ Funct from to $ ERSugar [] Nothing
     ]
 
-rowDef :: Parser TopLevelStat
+rowDef :: Parser (Span -> TopLevelStat)
 rowDef = do
   keyword KWRow
   n <- name
   symbol TAssign
-  RowDef n <$> effRow
+  row <- effRow
+  pure $ \sp -> RowDef sp n row
 
-functDef :: Parser TopLevelStat
+functDef :: Parser (Span -> TopLevelStat)
 functDef = do
   keyword KWFunct
   n <- name
@@ -384,12 +647,17 @@ functDef = do
         out <- optional typ
         symbol TAssign
         case out of
-          Just t -> FunctDef n ts es args fx t <$> block
-          Nothing -> FunctDef n ts es args Nothing (TFlat a) <$> block
+          Just t -> do
+            b <- block
+            pure $ \sp -> FunctDef sp n ts es args fx t b
+          Nothing -> do
+            b <- block
+            pure $ \sp -> FunctDef sp n ts es args Nothing (TFlat a) b
       _ -> do
         out <- typ
         symbol TAssign
-        FunctDef n ts es args fx out <$> block
+        b <- block
+        pure $ \sp -> FunctDef sp n ts es args fx out b
 
 functArgs :: Parser [FunctArg]
 functArgs = some functArg
@@ -424,9 +692,9 @@ block = do
 blockStat :: Parser BlockStat
 blockStat =
   choice [
-    try $ BBindDef <$> bindDef,
-    try $ BAssign <$> assign,
-    BExp <$> Parser.exp
+    try $ locStat $ BBindDefNode <$> bindDef,
+    try $ locStat $ BAssignNode <$> assign,
+    locStat $ BExpNode <$> Parser.exp
   ]
 
 bindDef :: Parser BindDef
@@ -537,7 +805,7 @@ exp = resumeExp --do
   -- es <- many $ prefixExp >>= parsePostfix
   -- pure $ foldl EApply e es
 resumeExp :: Parser Exp
-resumeExp = try (EResume <$> (keyword KWResume *> resumeExp)) <|> dollarExp
+resumeExp = try (loc $ NResume <$> (keyword KWResume *> resumeExp)) <|> dollarExp
 
 
 dollarExp :: Parser Exp
@@ -570,9 +838,9 @@ accessExp = do
 
 parseAccessOps :: Exp -> Parser Exp
 parseAccessOps e = do
-  m <- optional (symbol TAt *> (EPropAccess e <$> name))
+  m <- optional $ symbol TAt *> name
   case m of
-    Just e' -> parseAccessOps e'
+    Just n -> withSpanFrom (expSpan e) (NPropAccess e n) >>= parseAccessOps
     Nothing -> pure e
 
 parseWithOps :: Exp -> Parser Exp
@@ -583,7 +851,7 @@ parseWithOps e = do
         (, EffApps [] []) <$> typeApps,
         (TypeApps [], ) <$> effApps
       ]
-    pure $ EWith e ts es
+    withSpanFrom (expSpan e) (NWith e ts es)
   case m of
     Just e' -> parseWithOps e'
     Nothing -> pure e
@@ -601,9 +869,9 @@ prefixExp =
       try ifExp
   <|> try letExp
   <|> try under
-  <|> try (ELiteral <$> literal)
+  <|> try (loc $ NLiteral <$> literal)
   <|> try parensThing
-  <|> (EName <$> name)
+  <|> (loc $ NName <$> name)
 
 -- Постфикс и инфикс операторы
 parsePostfix :: Exp -> Parser Exp
@@ -639,39 +907,47 @@ parsePostfixOps e = do
 
 postfixOp :: Exp -> Parser Exp
 postfixOp e =
-      try (symbol TAt *> (EPropAccess e <$> name))
+      try $ do
+        n <- symbol TAt *> name
+        withSpanFrom (expSpan e) (NPropAccess e n)
   <|> (keyword KWWith *> do
         (ts, es) <- choice [
             try $ (,) <$> typeApps <*> effApps,
             (, EffApps [] []) <$> typeApps,
             (TypeApps [], ) <$> effApps
           ]
-        pure $ EWith e ts es
+        withSpanFrom (expSpan e) (NWith e ts es)
       )
 
 -- if-expression
 ifExp :: Parser Exp
 ifExp = do
+  start <- currentPos
   keyword KWIf
   cond <- Parser.exp
   keyword KWThen
   th <- Parser.exp
   keyword KWElse
-  EIfThenElse cond th <$> Parser.exp
+  e <- Parser.exp
+  withSpanFrom (spanFromPositions start start) (NIfThenElse cond th e)
 
 -- let-expression
 letExp :: Parser Exp
 letExp = do
+  start <- currentPos
   keyword KWLet
   lp <- letPattern
   symbol TAssign
   what <- Parser.exp
   keyword KWIn
-  ELet lp what <$> Parser.exp
+  e <- Parser.exp
+  withSpanFrom (spanFromPositions start start) (NLet lp what e)
 
 -- under-expression
 under :: Parser Exp
 under = do
+  start <- currentPos
+  let startSpan = spanFromPositions start start
   keyword KWUnder
   ec <- eCons
   keyword KWTo
@@ -679,26 +955,35 @@ under = do
   keyword KWHandle
   f <- optional $ try handlerClause
   cs <- many $ try handlerClause
-  EUnder <$> case f of
-    Just f' -> do
-      nt <- optional $ do
-        _ <- pipesym *> keyword KWThen
-        n <- name
-        t <- symbol TMatchArrow *> block
-        pure (n, t)
-      let (n, t) = fromMaybe (".", Block [] $ EName ".") nt
-      pure $ Under ec b (f' : cs) n t
-    Nothing -> do
-      n <- pipesym *> keyword KWThen *> name
-      t <- symbol TMatchArrow *> block
-      pure $ Under ec b cs n t
+  u <- case f of
+        Just f' -> do
+          nt <- optional $ do
+            _ <- pipesym *> keyword KWThen
+            n <- name
+            t <- symbol TMatchArrow *> block
+            pure (n, t)
+          case nt of
+            Just (n, t) -> pure $ Under ec b (f' : cs) n t
+            -- No 'then' clause: the host handler continues with the identity.
+            -- That node has no text of its own, so it borrows the span of the
+            -- clause it stands for rather than carrying 'noSpan'.
+            Nothing -> do
+              end <- currentPos
+              let sp = spanFromPositions start end
+              pure $ Under ec b (f' : cs) "." (Block [] $ Exp sp (NName "."))
+        Nothing -> do
+          n <- pipesym *> keyword KWThen *> name
+          t <- symbol TMatchArrow *> block
+          pure $ Under ec b cs n t
+  withSpanFrom startSpan (NUnder u)
 
 parensThing :: Parser Exp
 parensThing = do
+  start <- currentPos
   symbol TParenL
-  e <- try tupleInParens <|> (EParen <$> block)
+  e <- try tupleInParens <|> (withSpanFrom (spanFromPositions start start) . NParen =<< block)
   symbol TParenR
-  pure e
+  pure $ e {expSpan = mergeSpan (expSpan e) (spanFromPositions start start)}
 
 tupleInParens :: Parser Exp
 tupleInParens = do
@@ -740,9 +1025,9 @@ tupleOrExp = do
 
 simpleTerm :: Parser Exp
 simpleTerm =
-    ELiteral <$> literal
+    loc (NLiteral <$> literal)
     <|> parensThing
-    <|> EName <$> name
+    <|> loc (NName <$> name)
 
 handlerClause :: Parser HandlerClause
 handlerClause = do

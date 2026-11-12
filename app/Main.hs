@@ -6,10 +6,11 @@ import System.Environment (getArgs, withArgs)
 import System.Exit (exitFailure)
 import Benchmark (runBenchmarks, runEdgeSweepBenchmarks)
 import Suite (runSuite, runProgram)
+import Control.Monad (unless)
 
 main :: IO ()
 main = getArgs >>= \case
-  []                     -> runSuite >>= \ok -> if ok then pure () else exitFailure
+  []                     -> runSuite >>= \ok -> unless ok exitFailure
   ("--bench":rest)       -> withArgs (criterionArgs rest) runBenchmarks
   ("--bench-edges":rest) -> withArgs (criterionArgs rest) runEdgeSweepBenchmarks
   ["--run", name] -> runProgram name >>= \case

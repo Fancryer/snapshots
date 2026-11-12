@@ -1,3 +1,4 @@
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -34,7 +35,15 @@ import Types(
     TypeArg(..),
     Block,
     Stat(..),
+    pattern Bind, pattern Assign, pattern Expr,
+    atStatSpan, statSpan,
     Expr(..),
+    blockSpan,
+    pattern Int, pattern Float, pattern Boolean, pattern String, pattern Nil,
+    pattern XVar, pattern Array, pattern Pair, pattern XLambda, pattern NLambda,
+    pattern Apply, pattern Record, pattern With, pattern Handle, pattern Paren,
+    pattern Resume, pattern Let, pattern PropAccess, pattern IfElse,
+    exprSpan, exprNode,
     Handler(..),
     Lambda,
     Lambda(..),
@@ -78,11 +87,10 @@ import Unify (
     retTypeOf,
     applyEffRowSubst,
     withNewLevel,
-    currentLevel, subsumesEffRow, errorStack, throwTypeCheckError, withErrorStack, applyEffConsSubst, addEffLacks, addRowLacks, addRowLacksToRow
+    currentLevel, subsumesEffRow, throwTypeCheckError, throwTypeCheckErrorWithNotes, withErrorStack, applyEffConsSubst, addEffLacks, addRowLacks, addRowLacksToRow
   )
 import qualified Eff
 import qualified Scope
-import Control.Monad.Except (MonadError(throwError))
 import Control.Monad (foldM, when, forM)
 import Scope (enterScope)
 import Utils (uniqPreserveOrder, mapFst, Pretty (pretty), mapSnd)
@@ -102,14 +110,24 @@ import TypedIR (
     typeOfTypedBlock,
     Chunk,
     TopLevelStat(..),
-    FunctDecl(..), HandlerClause
+    FunctDecl(..), HandlerClause,
+    pattern TEInt, pattern TEFloat, pattern TEBoolean, pattern TEString,
+    pattern TENil, pattern TEXVar, pattern TEArray, pattern TEPair,
+    pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
+    pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
+    pattern TEPropAccess, pattern TEIfElse,
+    atTypedSpan, teSpan,
+    pattern Bind, pattern Rebind, pattern Expr,
+    atTypedStatSpan, tStatSpan
   )
 import Data.Text (Text)
 import Control.Lens (use, (^.))
 import Eff (rowHasEffect)
 import Control.Monad.IO.Class (liftIO)
 import Debug.Trace (trace)
-import ErrorContext (withFrame, IrFrame (IrFrame), ErrorFrame (..))
+import ErrorContext (IrFrame (IrFrame), ErrorFrame (..))
+import Suggest (suggestionNote)
+import Span (Span)
 import Data.Set (Set)
 
 data InferResult a = InferResult {
@@ -304,22 +322,25 @@ typeOfTypedBlockUnsafe b = do
     Left l -> throwTypeCheckError $ TypeError l
     Right r -> pure r
 
+-- | Run a top-level declaration check with a frame naming the declaration, so
+--   that an error about the declaration itself (a duplicate, say) points at
+--   its line instead of having no location at all.
+withDeclFrame :: Text -> Span -> TypeCheckM a -> TypeCheckM a
+withDeclFrame name sp = withErrorStack (EFIr $ IrFrame name sp)
+
 -- most important
 inferChunk :: [Text] -> Types.Chunk -> TypeCheckM TypedIR.Chunk
 inferChunk args chunk = do
   globalScope <- Scope.globalScope args
-  eStack <- use errorStack
-  let _ = withFrame (EFIr $ IrFrame "" Nothing) eStack $ \stack ->
-        stack
   -- Первый проход: регистрируем только эффекты и функции (с предварительными схемами)
   (scope1, funSigs) <- foldM (\(sc, sigs) stat -> case stat of
-      Types.SEffDef effDef -> do
+      Types.SEffDef sp effDef -> withDeclFrame ("effect " <> effName effDef) sp $ do
         when (Scope.hasEff False sc (effName effDef)) $
-          throwTypeCheckError $ TypeError $ "Duplicate effect definition: " <> effName effDef
+          throwTypeCheckError $ DuplicateDefinition $ "the effect `" <> effName effDef <> "` is defined twice"
         sc' <- Scope.addEffect effDef sc
         pure (sc', sigs)
 
-      Types.SFunctDef functDecl -> do
+      Types.SFunctDef sp functDecl -> withDeclFrame ("funct " <> functDecl.fName) sp $ do
         let (retFxs, retTyp) = functDecl.fRet
             argTypes = map snd functDecl.fArgs
             -- fullTyp = buildCurried argTypes retFxs retTyp
@@ -347,7 +368,7 @@ inferChunk args chunk = do
               Scheme tvars evars rvars Map.empty Map.empty fullTyp
 
         when (Scope.hasBinding False sc functDecl.fName) $
-          throwTypeCheckError $ TypeError $ "Duplicate function definition: " <> functDecl.fName
+          throwTypeCheckError $ DuplicateDefinition $ "the function `" <> functDecl.fName <> "` is defined twice"
 
         sc' <- Scope.addBinding functDecl.fName scheme (XVar functDecl.fName) Val sc
         pure (sc', sigs <> [(functDecl, retFxs, retTyp)])
@@ -362,18 +383,28 @@ inferChunk args chunk = do
           Scope.addBinding argName (monoScheme argTyp) (XVar argName) Val sc'
         ) funScope functDecl.fArgs
 
-      InferResult typedBlock blockFxs finalScope <- inferBlock scopeWithArgs functDecl.fBlock
-      blockTyp <- typeOfTypedBlockIn finalScope typedBlock
+      -- Errors about the signature as a whole (the body does not have the
+      -- declared type, or performs effects the row does not allow) belong to
+      -- the function, so they get a frame of their own.
+      let bodySpan = blockSpan functDecl.fBlock
+          funFrame = EFIr $ IrFrame ("funct " <> functDecl.fName) bodySpan
 
-      -- Унифицируем тип результата
-      scopeUnified <- unifyTypes finalScope blockTyp retTyp
+      (typedBlock, scopeUnified') <-
+        withErrorStack funFrame $ do
+          InferResult typedBlock blockFxs finalScope <- inferBlock scopeWithArgs functDecl.fBlock
+          blockTyp <- typeOfTypedBlockIn finalScope typedBlock
 
-      -- Унифицируем эффекты
-      let actualFxs = blockFxs
-          expectedFxs = fromMaybe (RClosed []) retFxs
-      scopeUnified' <- subsumesEffRow scopeUnified actualFxs expectedFxs
+          -- Унифицируем тип результата
+          scopeUnified <- unifyTypes finalScope blockTyp retTyp
 
-            -- Строим окончательный тип функции.
+          -- Унифицируем эффекты
+          let actualFxs = blockFxs
+              expectedFxs = fromMaybe (RClosed []) retFxs
+          scopeUnified' <- subsumesEffRow scopeUnified actualFxs expectedFxs
+
+          pure (typedBlock, scopeUnified')
+
+      -- Строим окончательный тип функции.
       -- Сначала применяем все подстановки к аргументам и результату.
       finalArgTypes <-
         mapM (applyTypeSubst scopeUnified' . snd) functDecl.fArgs
@@ -426,10 +457,10 @@ inferChunk args chunk = do
 
   -- Собираем остальные топ-левел статы
   otherStats <- forM chunk $ \case
-    Types.STypeDef name params typ -> pure $ Just $ TypedIR.STypeDef name params typ
-    Types.SEffDef effDef -> pure $ Just $ TypedIR.SEffDef effDef
-    Types.SRowDef rowDef -> pure $ Just $ TypedIR.SRowDef rowDef
-    Types.SFunctDef _ -> pure Nothing
+    Types.STypeDef _ name params typ -> pure $ Just $ TypedIR.STypeDef name params typ
+    Types.SEffDef _ effDef -> pure $ Just $ TypedIR.SEffDef effDef
+    Types.SRowDef _ rowDef -> pure $ Just $ TypedIR.SRowDef rowDef
+    Types.SFunctDef _ _ -> pure Nothing
 
   pure $ catMaybes (otherStats <> map Just typedFuns)
 
@@ -441,8 +472,16 @@ wrapInferResultWithCell :: InferResult TypedExpr -> InferM TypedExpr
 wrapInferResultWithCell (InferResult res fxs scope) =
   pure $ InferResult res (wrapTypedExprWithCell res fxs) scope
 
+-- | Type-check one expression.  The resulting typed node carries the span of
+--   the AST node it came from, and the frame pushed for the duration of the
+--   check is the one a diagnostic will point at.
 inferExpr :: Scope -> Expr -> InferM TypedExpr
-inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ case expr of
+inferExpr scope expr = do
+  InferResult res fxs sc <- inferNode scope expr
+  pure $ InferResult (atTypedSpan (exprSpan expr) res) fxs sc
+
+inferNode :: Scope -> Expr -> InferM TypedExpr
+inferNode scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) (exprSpan expr)) $ case expr of
   Int i -> pure $ InferResult (TEInt i) Eff.empty scope
   Float f -> pure $ InferResult (TEFloat f) Eff.empty scope
   Boolean b -> pure  $ InferResult (TEBoolean b) Eff.empty scope
@@ -450,7 +489,8 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
   Nil -> pure  $ InferResult TENil Eff.empty scope
   XVar v -> do
     (bindingT, scope', mut) <- case Scope.findBinding True scope v of
-      Nothing -> throwTypeCheckError $ UndefinedVariable v
+      Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable v)
+        (maybe [] pure (suggestionNote (Scope.bindingNames scope) v))
       Just (scheme, _, mut') -> do
         (t, sc) <- instantiateTypeScheme scope scheme
         pure (t, sc, mut')
@@ -501,7 +541,7 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
     calleeResolved <- applyTypeSubst scope'' calleeT'
     resultRow <- case calleeResolved of
       TFunct (Funct _ _ row) -> applyEffRowSubst scope'' row
-      _ -> throwTypeCheckError $ TypeError "Apply: callee must be a function"
+      _ -> throwTypeCheckError $ ApplicationError "the left side of an application is not a function"
 
     -- Объединяем все эффекты: вычисление callee, вычисление arg, и эффект из типа функции
     let finalFxs = Eff.unionEffRowsList [argFxs, resultRow, calleeFxs]
@@ -525,16 +565,16 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
             rvarsLength = length rvars
 
         when (typesLength /= tvarsLength) $
-          throwTypeCheckError $ TypeError $ T.pack $
-            printf "Wrong type args amount in with: expected %d, given %d" tvarsLength typesLength
+          throwTypeCheckError $ ApplicationError $ T.pack $
+            printf "`with` applied %d type argument(s) to an expression that abstracts over %d" typesLength tvarsLength
 
         when (fxsLength /= evarsLength) $
-          throwTypeCheckError $ TypeError $ T.pack $
-            printf "Wrong effect args amount in with: expected %d, given %d" evarsLength fxsLength
+          throwTypeCheckError $ ApplicationError $ T.pack $
+            printf "`with` applied %d effect argument(s) to an expression that abstracts over %d" fxsLength evarsLength
 
         when (rowsLength /= rvarsLength) $
-          throwTypeCheckError $ TypeError $ T.pack $
-            printf "Wrong row args amount in with: expected %d, given %d" rvarsLength rowsLength
+          throwTypeCheckError $ ApplicationError $ T.pack $
+            printf "`with` applied %d row argument(s) to an expression that abstracts over %d" rowsLength rvarsLength
 
         let scope1 = enterScope exprScope
 
@@ -566,8 +606,8 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
         wrapInferResultWithCell $
           InferResult exprExpr' row scope6
 
-      t -> throwTypeCheckError $ TypeError $ T.concat
-        ["with: expression type `", T.pack $ show t, "` is not forall"]
+      t -> throwTypeCheckError $ ApplicationError $ T.concat
+        ["`with` needs a polymorphic expression, but this one has the type `", pretty t, "`"]
   Handle handler -> inferHandler scope handler
   Record a ps -> inferRecord scope a ps
   Paren b -> do
@@ -614,7 +654,9 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
         case find (\(TERecordProp _ n' _ _) -> n == n') props of
           Just (TERecordProp mutP _ _ e') ->
             wrapInferResultWithCell $ InferResult e' (Eff.unionEffRows fxs (readIf mutP)) scope'
-          Nothing -> throwTypeCheckError $ TypeError $ "Record doesn't have binding '" <> n <> "'"
+          Nothing -> throwTypeCheckErrorWithNotes
+            (RecordError $ "this record has no field `" <> n <> "`")
+            (maybe [] pure (suggestionNote (map (\(TERecordProp _ n' _ _) -> n') props) n))
       _ -> do
         recT <- typeOfTypedExprUnsafe t
         case recT of
@@ -623,10 +665,12 @@ inferExpr scope expr = withErrorStack (EFIr $ IrFrame (pretty expr) Nothing) $ c
               Just rp ->
                 wrapInferResultWithCell $
                   InferResult (TEPropAccess t n) (Eff.unionEffRows fxs (readIf (tMut rp))) scope'
-              Nothing -> throwTypeCheckError $ TypeError $ "Record doesn't have binding '" <> n <> "'"
+              Nothing -> throwTypeCheckErrorWithNotes
+                (RecordError $ "this record has no field `" <> n <> "`")
+                (maybe [] pure (suggestionNote (map tName rprops) n))
           _ ->
-            throwTypeCheckError $ TypeError $ T.pack
-            $ printf "Cannot access property '%s' of expression: expected record, got: %s" n $ pretty recT
+            throwTypeCheckError $ RecordError $ T.pack
+            $ printf "cannot read the field `%s` of a value of type `%s`; only records have fields" n $ pretty recT
   IfElse p t f -> do
     InferResult typP pFxs pScope <- inferExpr scope p
     typP' <- typeOfTypedExprIn pScope typP
@@ -706,8 +750,8 @@ inferRecord scope (Just anchor) props = withNewLevel $ do
           case find ((name ==) . tName) baseProps of
             Just (TRecordProp baseMut _ _) ->
               if baseMut /= mut then
-                throwTypeCheckError $ TypeError $ T.pack
-                $ printf "Cannot change mutability of field '%s' from %s to %s" name baseMut mut
+                throwTypeCheckError $ RecordError $ T.pack
+                $ printf "the field `%s` is %s in the record being extended, so it cannot become %s" name baseMut mut
               else do
                 -- Удаляем старое TERecordProp с таким же именем, если есть
                 let accProps' = filter (\(TERecordProp _ n _ _) -> n /= name) accProps
@@ -721,7 +765,7 @@ inferRecord scope (Just anchor) props = withNewLevel $ do
               pure (accProps <> [TERecordProp mut name propT exprExpr], Eff.unionEffRows accFxs exprFxs, sc'')
         ) ([], anchorFxs, scope1) props
       wrapInferResultWithCell $ InferResult (TERecord (Just anchorExpr) recProps) propFxs finalScope
-    _ -> throwTypeCheckError $ TypeError "Record anchor must be a record type"
+    _ -> throwTypeCheckError $ RecordError "a record can only be built from another record, but this base is not one"
 
 inferHandler :: Scope -> Types.Handler -> InferM TypedExpr
 inferHandler scope handler = withNewLevel $
@@ -729,11 +773,11 @@ inferHandler scope handler = withNewLevel $
   case handlerCons handler of
     EVar v ->
       throwTypeCheckError $
-        TypeError $
-          T.concat ["Cannot use effect variable `", tasteName v, "` as handler cons"]
+        HandlerError $
+          T.concat ["`", tasteName v, "` is an effect variable, not an effect, so it cannot be handled"]
     eff@(EffCons eff'@(ECons n _)) -> do
       ops <- case Scope.findEffOps True scope n of
-        Nothing -> throwTypeCheckError $ TypeError $ "Effect '" <> n <> "' is not presented in this scope"
+        Nothing -> throwTypeCheckError $ HandlerError $ "there is no effect named `" <> n <> "` in scope"
         Just ops -> pure ops
       let opNames = map fst ops
       -- 2. Создаём подскоуп с операциями
@@ -770,15 +814,15 @@ inferHandler scope handler = withNewLevel $
               extra = filter (`notElem` opNames) clauseNames
 
           when (length clauseNames /= length (nub clauseNames)) $
-            throwTypeCheckError $ TypeError "Duplicate handler clause names"
+            throwTypeCheckError $ DuplicateDefinition "the same operation is handled twice"
 
           when (missing /= []) $
             throwTypeCheckError $
-              TypeError $ "Handler missing operations: " <> T.intercalate ", " missing
+              HandlerError $ "this handler does not handle: " <> T.intercalate ", " missing
 
           when (extra /= []) $
             throwTypeCheckError $
-              TypeError $ "Handler defines unknown operations: " <> T.intercalate ", " extra
+              HandlerError $ "this handler handles operations that the effect does not declare: " <> T.intercalate ", " extra
 
           -- Обрабатываем операции в порядке их объявления,
           -- но находим соответствующую clause по имени.
@@ -786,7 +830,7 @@ inferHandler scope handler = withNewLevel $
             foldM
               (\(acc, sc) (name, opTyp) ->
                 case find ((== name) . fst) clauses of
-                  Nothing -> throwTypeCheckError $ TypeError $ "Handler missing operation: " <> name
+                  Nothing -> throwTypeCheckError $ HandlerError $ "this handler does not handle `" <> name <> "`"
 
                   Just (_, lam) -> do
 
@@ -820,7 +864,7 @@ inferHandler scope handler = withNewLevel $
                         r' <-
                           case retTypeOf opTyp' of
                             Just r -> pure r
-                            Nothing -> throwTypeCheckError $ TypeError "Cannot happen"
+                            Nothing -> throwTypeCheckError $ HandlerError "the operation type is not a function, so it has no result to resume with"
 
                         t <- generalize sc1 $ TFunct $ Funct r' blockT' handlerRow
                         sc2 <- Scope.addBinding "resume" t (XVar "resume") Val sc1
@@ -978,7 +1022,16 @@ inferBlock outer (stats, expr) = withNewLevel $ do
     (Scope.keepSubst scope' outer)
 
 inferStat :: Scope -> Types.Stat -> InferM TypedIR.Stat
-inferStat scope = \case
+inferStat scope stat = do
+  res <- inferStatNode scope stat
+  -- The statement's own span wins over the span of its right-hand side: an
+  -- error about the statement should point at the statement.
+  let InferResult st' fxs sc' = res
+  pure $ InferResult (atTypedStatSpan (statSpan stat) st') fxs sc'
+
+inferStatNode :: Scope -> Types.Stat -> InferM TypedIR.Stat
+inferStatNode scope stat =
+  withErrorStack (EFIr $ IrFrame (pretty stat) (statSpan stat)) $ case stat of
   Types.Expr e -> do
     InferResult e' fxs scope' <- inferExpr scope e
     pure $ InferResult
@@ -1051,7 +1104,8 @@ inferStat scope = \case
         scope5
   Types.Assign n e -> do
     (scheme, _, mut) <- case Scope.findBinding True scope n of
-      Nothing -> throwTypeCheckError $ UndefinedVariable n
+      Nothing -> throwTypeCheckErrorWithNotes (UndefinedVariable n)
+        (maybe [] pure (suggestionNote (Scope.bindingNames scope) n))
       Just found -> pure found
     when (mut /= Var) $ throwTypeCheckError $ ImmutableVariableAssignment n
     (varT, scope') <- instantiateTypeScheme scope scheme
@@ -1059,6 +1113,20 @@ inferStat scope = \case
     let finalFxs = Eff.unionEffRows eFxs $ Eff.closedOfFlat "Rebind"
     eT' <- typeOfTypedExprUnsafe eT
     InferResult (TypedIR.Rebind n eT) finalFxs <$> unifyTypes scope'' varT eT'
+
+-- | Name the variables that blocked a generalisation, for the diagnostic.
+describeStuck :: ([Taste], [Taste], [Taste]) -> Text
+describeStuck (ts, es, rs) =
+  T.intercalate ", " $ filter (not . T.null)
+    [ labelled "type variable" ts
+    , labelled "effect variable" es
+    , labelled "row variable" rs
+    ]
+  where
+    labelled kind xs =
+      case xs of
+        [] -> ""
+        _ -> kind <> "s " <> T.intercalate ", " (map (("`" <>) . tasteName) xs)
 
 generalize :: Scope -> Typ -> TypeCheckM TypeScheme
 generalize scope typ = do
@@ -1090,13 +1158,13 @@ generalize scope typ = do
       nonGeneralizableEvars,
       nonGeneralizableRvars
     ]) $
-      throwTypeCheckError $ TypeError $
-        "Cannot generalize: " <>
-        T.pack (show (
-          nonGeneralizableTvars,
-          nonGeneralizableEvars,
-          nonGeneralizableRvars
-        ))
+      throwTypeCheckError $ InferenceError $
+        "Cannot generalize this binding: " <>
+        describeStuck (nonGeneralizableTvars, nonGeneralizableEvars, nonGeneralizableRvars) <>
+        ". Its type mentions type or effect variables that are still free at " <>
+        "the level where the binding was defined, so it cannot be made " <>
+        "polymorphic. Add a type annotation that fixes them, or move the " <>
+        "binding out of the inner scope."
 
   pure Scheme {
     _ts = tvars,

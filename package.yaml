@@ -1,8 +1,8 @@
 name:                Marran
-version:             0.1.0.0
+version:             0.1.0.1
 github:              "Fancryer/snapshots"
 license:             BSD-3-Clause
-author:              "Fancryer"
+author:              "Alice Eve Liddell"
 maintainer:          "Fancryer"
 copyright:           "2025 Fancryer"
 
@@ -78,6 +78,10 @@ tests:
       GeneralizeSpec
       FreezeSpec
       ExamplesSpec
+      SpanSpec
+      DiagnosticSpec
+      ParserSpec
+      SuggestSpec
     ghc-options:
     - -threaded
     - -rtsopts

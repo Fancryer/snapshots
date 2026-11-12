@@ -1,0 +1,13 @@
+//| Котировка: imm замораживает и цену, и код, который её читает. Ожидается: 10, 30, 15, 45
+funct line (unit Int) (qty Int) : Int =
+  if ieq qty 0 then 0 else + unit (line unit (- qty 1))
+
+funct main () : {Output; Var; Rebind; Read} () =
+  var unit = 10;
+  imm january = #{ val at = unit; val total = {(q) : Int = line unit q} };
+  unit := + unit 5;
+  val march = #{ val at = unit; val total = {(q) : Int = line unit q} };
+  sayn january@at;
+  sayn (january@total 3);
+  sayn march@at;
+  sayn (march@total 3)

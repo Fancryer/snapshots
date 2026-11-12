@@ -5,11 +5,11 @@ cabal-version: 2.2
 -- see: https://github.com/sol/hpack
 
 name:           Marran
-version:        0.1.0.0
+version:        0.1.0.1
 description:    Please see the README on GitHub at <https://github.com/Fancryer/snapshots#readme>
 homepage:       https://github.com/Fancryer/snapshots#readme
 bug-reports:    https://github.com/Fancryer/snapshots/issues
-author:         Fancryer
+author:         Alice Eve Liddell
 maintainer:     Fancryer
 copyright:      2025 Fancryer
 license:        BSD-3-Clause
@@ -43,6 +43,8 @@ library
       Resume
       Scope
       Sexp
+      Span
+      Suggest
       Suite
       TypedIR
       Types
@@ -119,7 +121,7 @@ test-suite marran-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      UnifySpec GeneralizeSpec FreezeSpec ExamplesSpec
+      UnifySpec GeneralizeSpec FreezeSpec ExamplesSpec SpanSpec DiagnosticSpec ParserSpec SuggestSpec
   hs-source-dirs:
       test
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N

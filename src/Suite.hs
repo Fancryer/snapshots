@@ -30,11 +30,15 @@ import System.IO
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 
 import Elaborator (elaborate, ElabState(..))
-import ErrorContext (toErrorText)
+import ErrorContext (
+    ErrorFrame(..), renderError, insertSource, emptySourceMap,
+    renderDiagnostic, diagnostic, Severity(SevError), renderErrorWith, primaryLabel,
+    Diagnostic(..), innermost
+  )
 import Infer (inferChunk)
-import IntInterpreter (interpret)
-import Parser (parseFromText, chunk)
-import Unify (TypeCheckState(..), evalTypeCheckM)
+import IntInterpreter (interpret, InterpError(..))
+import Parser (parseFromTextNamed, chunk)
+import Unify (TypeCheckState(..), evalTypeCheckM, errorCode)
 import Utils (Pretty(..))
 
 -- | One runnable program and the lines it must print.
@@ -47,6 +51,7 @@ cases =
   , ("rebind_shared",     ["2"])
   , ("param_reentrancy",  ["3", "4", "3"])
   , ("counter",           ["1", "2"])
+  , ("quote",             ["10", "30", "15", "45"])
   , ("imm_snapshot",      ["6"])
   , ("imm_make",          ["0", "0"])
   , ("imm_recursion",     ["15"])
@@ -79,21 +84,37 @@ runProgram name =
     Nothing -> pure $ Left $ "program not found: " ++ name ++ ".marr"
     Just path -> do
       src <- T.pack <$> readFile path
-      case elaborate <$> parseFromText chunk src of
+      -- The source map is what lets the renderer quote the offending lines; the
+      -- name of the file in the map must match the one recorded in the spans.
+      let sources = insertSource (T.pack path) src emptySourceMap
+      case elaborate <$> parseFromTextNamed path chunk src of
         Left e -> pure $ Left e
         Right elabAction ->
           case evalState (runExceptT elabAction) (ElabState 0) of
-            Left e -> pure $ Left $ "elaboration error: " ++ show e
+            Left e -> pure . Left . T.unpack $
+              renderDiagnostic sources (diagnostic SevError Nothing (pretty e))
             Right c' ->
               case evalTypeCheckM (inferChunk [] c') (TypeCheckState (0, 0, 0) 0 []) of
-                Left (stack, err) -> pure . Left . T.unpack $ T.concat
-                  [ pretty err, "\n", T.unlines (map toErrorText stack) ]
-                Right ic -> Right <$> captureStdout (interpret ic [])
+                Left (stack, err) ->
+                  pure . Left . T.unpack $
+                    renderErrorWith sources (innermost stack) (errorCode err) (pretty err) stack
+                Right ic -> do
+                  r <- captureStdoutWith (interpret ic [])
+                  case r of
+                    (Left err, _) -> pure . Left . T.unpack $
+                      renderDiagnostic sources ((diagnostic SevError Nothing (pretty err)) {
+                        diagLabels = [primaryLabel (ieSpan err) ""]
+                      })
+                    (Right _, out) -> pure $ Right out
 
 -- | Run an action with @stdout@ redirected to a temporary file and return what
 --   was written to it.
 captureStdout :: IO a -> IO String
-captureStdout action = do
+captureStdout action = snd <$> captureStdoutWith action
+
+-- | 'captureStdout' that also keeps the action's result.
+captureStdoutWith :: IO a -> IO (a, String)
+captureStdoutWith action = do
   tmp <- getTemporaryDirectory
   (path, h) <- openTempFile tmp "marran-out.txt"
   let cleanup = do
@@ -103,11 +124,12 @@ captureStdout action = do
   bracket (hDuplicate stdout) (\saved -> hDuplicateTo saved stdout >> hClose saved) $ \saved ->
     (do hDuplicateTo h stdout
         hSetBuffering stdout LineBuffering
-        _ <- action
+        result <- action
         hFlush stdout
         hDuplicateTo saved stdout
         hSeek h AbsoluteSeek 0
-        T.unpack <$> TIO.hGetContents h)
+        out <- T.unpack <$> TIO.hGetContents h
+        pure (result, out))
       `finally` cleanup
 
 -- | Run the whole suite; returns 'True' when every check passes.
@@ -118,7 +140,7 @@ runSuite = do
   results <- mapM check cases
   rejectedOk <- checkRejected
   let failures = [ n | (n, ok) <- results, not ok ]
-                 ++ [ rejectedProgram | not rejectedOk ]
+                  ++ [ rejectedProgram | not rejectedOk ]
       total = length cases + 1
   putStrLn ""
   if null failures

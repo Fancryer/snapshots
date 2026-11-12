@@ -23,12 +23,12 @@ stack build          # library and the marran-exe driver
 stack test           # unit tests and the example programs of the paper
 ```
 
-`stack test` runs two things: the Hspec suites for unification,
-generalisation and freezing, and every example program under `app/marr`.
-The programs are elaborated, type-checked and interpreted with the mutation
-event check enabled; each one is compared against its expected output, and
-`app/marr/imm_needs_read.marr` must be rejected by the type checker. A
-failure fails the test suite.
+`stack test` runs the Hspec suites for unification, generalisation, freezing,
+source spans, diagnostics, syntax errors and suggestions, and every example
+program under `app/marr`. The programs are elaborated, type-checked and
+interpreted with the mutation event check enabled; each one is compared
+against its expected output, and `app/marr/imm_needs_read.marr` must be
+rejected by the type checker. A failure fails the test suite.
 
 The executable runs the same examples by hand:
 
@@ -49,8 +49,12 @@ stack exec marran-exe -- --bench-edges --csv bench_edges.csv
 - `app/` — the executable (`Main.hs`) and the example programs (`app/marr`).
   `app/marr/handle_while.marr` (effect handlers with an explicit polymorphic
   type argument) does not type-check yet and is kept as a known-failing
-  experiment; the ten programs of Table 1 all pass.
-- `test/` — the Hspec suites.
+  experiment; the eleven programs of Table 1 all pass.
+- `test/` — the Hspec suites. `SpanSpec` checks that every syntax node
+  carries a source position, `DiagnosticSpec` pins the shape of rendered
+  diagnostics, and `SuggestSpec` pins when a "did you mean" hint is offered
+  and, more importantly, when it is not.
+- `docs/errors.md` — how errors are rendered and what the `E____` codes mean.
 - `prover/marr/` — a Lean 4 development that checks the syntactic facts about
   `freeze` used by the paper (that `freeze` yields frozen terms, is the
   identity on them, preserves bound names and does not add free variables).

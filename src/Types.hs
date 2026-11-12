@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module Types (
   Taste(..),
@@ -12,13 +13,42 @@ module Types (
   ECons(..),
   EffDef(..),
   Expr(..),
+  ExprNode(..),
+  pattern Int,
+  pattern Float,
+  pattern Boolean,
+  pattern String,
+  pattern Nil,
+  pattern XVar,
+  pattern Array,
+  pattern Pair,
+  pattern XLambda,
+  pattern NLambda,
+  pattern Apply,
+  pattern Record,
+  pattern With,
+  pattern Handle,
+  pattern Paren,
+  pattern Resume,
+  pattern Let,
+  pattern PropAccess,
+  pattern IfElse,
+  atSpan,
   -- Scope(..),
   Block,
+  blockSpan,
   -- NativeBlock,
   Stat(..),
+  StatNode(..),
+  pattern Bind,
+  pattern Assign,
+  pattern Expr,
+  atStatSpan,
+  statSpan,
   Lambda(..),
   -- NativeLambda(..),
   TopLevelStat(..),
+  topLevelSpan,
   FunctDecl(..),
   Handler(..),
   HandlerSig(..),
@@ -65,6 +95,7 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Control.Applicative as Set
 import qualified Data.Set as Set
+import Span (Span, noSpan, mergeSpan, mergeSpans)
 
 -- TODO: replace name-based reachability with binding-identity-based analysis;
 -- reduce false positives caused by shadowing.
@@ -245,50 +276,182 @@ data RowDef = RowDef Text EffRow deriving (Show, Generic)
 instance Pretty RowDef where
   pretty (RowDef n row) = "row " <> n <> " = " <> pretty row
 
-data Expr =
-  Int Integer
-  | Float Scientific
-  | Boolean Bool
-  | String Text
-  | Nil
-  | XVar Text
-  | Array [Expr]
-  | Pair Expr Expr
-  | XLambda Lambda
-  | NLambda NativeLambdaSign
-  | Apply Expr Expr
-  | Record (Maybe Expr) [ERecordProp]
-  | With Expr [TypeArg] [EffCons] [EffRow]
-  | Handle Handler
-  | Paren Block
-  | Resume Expr
-  | Let LetPattern Expr Expr
-  | PropAccess Expr Text
-  | IfElse Expr Expr Expr
+-- | An expression together with the region of source it came from.  The
+--   elaborator copies the position of the AST node it came from; nodes that
+--   have no corresponding source text get 'noSpan'.
+data Expr = MkExpr {
+    exprSpan :: Span
+  , exprNode :: ExprNode
+  } deriving (Eq, Ord, Show)
+
+-- | The shape of an expression, without its position.
+data ExprNode =
+    IntNode Integer
+  | FloatNode Scientific
+  | BooleanNode Bool
+  | StringNode Text
+  | NilNode
+  | XVarNode Text
+  | ArrayNode [Expr]
+  | PairNode Expr Expr
+  | XLambdaNode Lambda
+  | NLambdaNode NativeLambdaSign
+  | ApplyNode Expr Expr
+  | RecordNode (Maybe Expr) [ERecordProp]
+  | WithNode Expr [TypeArg] [EffCons] [EffRow]
+  | HandleNode Handler
+  | ParenNode Block
+  | ResumeNode Expr
+  | LetNode LetPattern Expr Expr
+  | PropAccessNode Expr Text
+  | IfElseNode Expr Expr Expr
   deriving (Eq, Ord, Show)
 
+pattern Int :: Integer -> Expr
+pattern Int i <- MkExpr _ (IntNode i) where
+  Int i = MkExpr noSpan (IntNode i)
+
+pattern Float :: Scientific -> Expr
+pattern Float f <- MkExpr _ (FloatNode f) where
+  Float f = MkExpr noSpan (FloatNode f)
+
+pattern Boolean :: Bool -> Expr
+pattern Boolean b <- MkExpr _ (BooleanNode b) where
+  Boolean b = MkExpr noSpan (BooleanNode b)
+
+pattern String :: Text -> Expr
+pattern String s <- MkExpr _ (StringNode s) where
+  String s = MkExpr noSpan (StringNode s)
+
+pattern Nil :: Expr
+pattern Nil <- MkExpr _ NilNode where
+  Nil = MkExpr noSpan NilNode
+
+pattern XVar :: Text -> Expr
+pattern XVar n <- MkExpr _ (XVarNode n) where
+  XVar n = MkExpr noSpan (XVarNode n)
+
+pattern Array :: [Expr] -> Expr
+pattern Array es <- MkExpr _ (ArrayNode es) where
+  Array es = MkExpr (mergeSpans (map exprSpan es)) (ArrayNode es)
+
+pattern Pair :: Expr -> Expr -> Expr
+pattern Pair l r <- MkExpr _ (PairNode l r) where
+  Pair l r = MkExpr (mergeSpan (exprSpan l) (exprSpan r)) (PairNode l r)
+
+pattern XLambda :: Lambda -> Expr
+pattern XLambda l <- MkExpr _ (XLambdaNode l) where
+  XLambda l = MkExpr noSpan (XLambdaNode l)
+
+pattern NLambda :: NativeLambdaSign -> Expr
+pattern NLambda n <- MkExpr _ (NLambdaNode n) where
+  NLambda n = MkExpr noSpan (NLambdaNode n)
+
+pattern Apply :: Expr -> Expr -> Expr
+pattern Apply f x <- MkExpr _ (ApplyNode f x) where
+  Apply f x = MkExpr (mergeSpan (exprSpan f) (exprSpan x)) (ApplyNode f x)
+
+pattern Record :: Maybe Expr -> [ERecordProp] -> Expr
+pattern Record a ps <- MkExpr _ (RecordNode a ps) where
+  Record a ps =
+    MkExpr (mergeSpans (maybe [] (\x -> [exprSpan x]) a <> map (exprSpan . erExpr) ps)) (RecordNode a ps)
+
+pattern With :: Expr -> [TypeArg] -> [EffCons] -> [EffRow] -> Expr
+pattern With e ts es rs <- MkExpr _ (WithNode e ts es rs) where
+  With e ts es rs = MkExpr (exprSpan e) (WithNode e ts es rs)
+
+pattern Handle :: Handler -> Expr
+pattern Handle h <- MkExpr _ (HandleNode h) where
+  Handle h = MkExpr noSpan (HandleNode h)
+
+pattern Paren :: Block -> Expr
+pattern Paren b <- MkExpr _ (ParenNode b) where
+  Paren b = MkExpr noSpan (ParenNode b)
+
+pattern Resume :: Expr -> Expr
+pattern Resume e <- MkExpr _ (ResumeNode e) where
+  Resume e = MkExpr (exprSpan e) (ResumeNode e)
+
+pattern Let :: LetPattern -> Expr -> Expr -> Expr
+pattern Let p w b <- MkExpr _ (LetNode p w b) where
+  Let p w b = MkExpr (mergeSpan (exprSpan w) (exprSpan b)) (LetNode p w b)
+
+pattern PropAccess :: Expr -> Text -> Expr
+pattern PropAccess e n <- MkExpr _ (PropAccessNode e n) where
+  PropAccess e n = MkExpr (exprSpan e) (PropAccessNode e n)
+
+pattern IfElse :: Expr -> Expr -> Expr -> Expr
+pattern IfElse p t f <- MkExpr _ (IfElseNode p t f) where
+  IfElse p t f =
+    MkExpr (mergeSpan (exprSpan p) (mergeSpan (exprSpan t) (exprSpan f))) (IfElseNode p t f)
+
+{-# COMPLETE Int, Float, Boolean, String, Nil, XVar, Array, Pair, XLambda
+   , NLambda, Apply, Record, With, Handle, Paren, Resume, Let, PropAccess
+   , IfElse #-}
+
+-- | Move an expression to a different span.  Used by the elaborator, which
+--   knows the span of the AST node a node came from.
+atSpan :: Span -> Expr -> Expr
+atSpan s e = e {exprSpan = s}
+
 instance Pretty Expr where
+  pretty (MkExpr _ n) = pretty n
+
+instance Pretty ExprNode where
   pretty = \case
-    Int i -> T.pack $ show i
-    Float f -> T.pack $ show f
-    Boolean b -> T.pack $ show b
-    String s -> "'" <> s <> "'"
-    Nil -> "()"
-    XVar n -> n
-    -- Array [ArrayEntry]
-    Pair l r -> "(" <> pretty l <> ", " <> pretty r <> ")"
-    XLambda l -> pretty l
-    -- NLambda NativeLambda
-    Apply f e -> pretty f <> " " <> pretty e
-    -- Record (Maybe Expr) [ERecordProp]
-    -- With Expr [TypeArg] [EffCons] -- expr with [ts] {fxs}
-    Handle h -> pretty h
-    Paren b -> "(" <> pretty b <> ")"
-    Resume e -> "resume " <> pretty e
-    -- Let LetPattern Expr Expr
-    PropAccess e n -> pretty e <> "@" <> n
-    IfElse p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
-    e -> T.pack $ show e
+    IntNode i -> T.pack $ show i
+    FloatNode f -> T.pack $ show f
+    BooleanNode b -> if b then "true" else "false"
+    StringNode s -> "'" <> s <> "'"
+    NilNode -> "()"
+    XVarNode n -> n
+    ArrayNode es -> "[" <> T.intercalate " " (map pretty es) <> "]"
+    PairNode l r -> "(" <> pretty l <> ", " <> pretty r <> ")"
+    XLambdaNode l -> pretty l
+    NLambdaNode (NativeLambdaSign n t r fxs) ->
+      n <> " : " <> pretty t <> " -> " <> prettyFxs fxs <> pretty r
+    ApplyNode f e -> pretty f <> " " <> pretty e
+    RecordNode ext props ->
+      "#{" <> maybe "" ((<> " | ") . pretty) ext
+          <> T.intercalate "; " (map prettyERecordProp props) <> "}"
+    WithNode e ts es rs ->
+      pretty e <> " with [" <> T.intercalate "; " (map pretty ts) <> "]"
+        <> (if null es then "" else " {" <> T.intercalate "; " (map pretty es) <> "}")
+        <> (if null rs then "" else " " <> T.intercalate " " (map pretty rs))
+    HandleNode h -> pretty h
+    ParenNode b -> "(" <> pretty b <> ")"
+    ResumeNode e -> "resume " <> pretty e
+    LetNode p w b -> "let " <> prettyLetPattern p <> " = " <> pretty w <> " in " <> pretty b
+    PropAccessNode e n -> pretty e <> "@" <> n
+    IfElseNode p t f -> "if " <> pretty p <> " then " <> pretty t <> " else " <> pretty f
+
+prettyERecordProp :: ERecordProp -> Text
+prettyERecordProp p = T.concat [
+    pretty (erMut p), " ", erName p,
+    maybe "" ((" : " <>) . pretty) (erType p),
+    " = ", pretty (erExpr p)
+  ]
+
+prettyLetPattern :: LetPattern -> Text
+prettyLetPattern = \case
+  LPATom a -> prettyAtomLetPattern a
+  LPParam (LambdaParam n mt) ->
+    "(" <> n <> maybe "" ((" : " <>) . pretty) mt <> ")"
+
+prettyAtomLetPattern :: AtomLetPattern -> Text
+prettyAtomLetPattern = \case
+  ALPNil -> "()"
+  ALPUnderscore -> "_"
+  ALPPair a b -> "(" <> prettyLetPattern a <> ", " <> prettyLetPattern b <> ")"
+  ALPRecord ps ->
+    "#{" <> T.intercalate "; " (map prettyLetPatternRecordProp ps) <> "}"
+
+prettyLetPatternRecordProp :: LetPatternRecordProp -> Text
+prettyLetPatternRecordProp (LetPatternRecordProp m (LambdaParam n mt) pat) = T.concat [
+    pretty m, " ", n,
+    maybe "" ((" : " <>) . pretty) mt,
+    maybe "" ((" = " <>) . prettyAtomLetPattern) pat
+  ]
 
 data TypeArg =
   TAInt
@@ -356,16 +519,22 @@ instance Pretty Lambda where
   pretty (Lambda ts es n t r fxs b) = T.concat [
       "{",
       prettyTvars ts True,
-      " ",
-      if null es then " " else "{" <> T.intercalate "; " (map tasteName es) <> "} ",
+      if null es then "" else "{" <> T.intercalate "; " (map tasteName es) <> "} ",
       "(", n, maybe "" ((" : " <>) . pretty) t, ")",
       " : ",
-      pretty fxs,
+      prettyFxs fxs,
       maybe "" pretty r,
       " = ",
       pretty b,
       "}"
     ]
+
+-- | A latent effect row in a function type: compact, and omitted when empty,
+--   because @{}Int@ reads as if the type were mangled.
+prettyFxs :: EffRow -> Text
+prettyFxs = \case
+  RClosed [] -> ""
+  fxs -> pretty fxs <> " "
 
 instance Show Lambda where
   show (Lambda ts es arg argT retT fxs block) =
@@ -385,6 +554,12 @@ instance Show Lambda where
 -- type NativeBlock  = (Typ, Expr)
 type Block        = ([Stat], Expr)
 
+-- | The region a block covers: from its first statement to its result
+--   expression.  Blocks are a pair rather than a record, so the span is
+--   derived from the parts that have one.
+blockSpan :: Block -> Span
+blockSpan (stats, e) = mergeSpans (map statSpan stats <> [exprSpan e])
+
 instance Pretty Block where
   pretty (stats, e) = T.concat [
       T.intercalate "; " $ map pretty stats,
@@ -392,38 +567,77 @@ instance Pretty Block where
       pretty e
     ]
 
-data Stat =
-  Bind Mutability Text (Maybe Typ) Expr
-  | Assign Text Expr
-  | Expr Expr
-  deriving (Eq, Ord)
+-- | A statement of the IR, with the source region it came from.
+data Stat = MkStat {
+    statSpan :: Span
+  , statNode :: StatNode
+  } deriving (Eq, Ord)
+
+-- | The shape of a statement, without its position.
+data StatNode =
+    BindNode Mutability Text (Maybe Typ) Expr
+  | AssignNode Text Expr
+  | ExprNode Expr
+  deriving (Eq, Ord, Show)
+
+pattern Bind :: Mutability -> Text -> Maybe Typ -> Expr -> Stat
+pattern Bind m n t e <- MkStat _ (BindNode m n t e) where
+  Bind m n t e = MkStat (exprSpan e) (BindNode m n t e)
+
+pattern Assign :: Text -> Expr -> Stat
+pattern Assign n e <- MkStat _ (AssignNode n e) where
+  Assign n e = MkStat (exprSpan e) (AssignNode n e)
+
+pattern Expr :: Expr -> Stat
+pattern Expr e <- MkStat _ (ExprNode e) where
+  Expr e = MkStat (exprSpan e) (ExprNode e)
+
+{-# COMPLETE Bind, Assign, Expr #-}
+
+-- | Move a statement to the given span.
+atStatSpan :: Span -> Stat -> Stat
+atStatSpan s st = st {statSpan = s}
 
 instance Pretty Stat where
+  pretty = pretty . statNode
+
+instance Pretty StatNode where
   pretty = \case
-    Bind m n t e -> T.concat [pretty m, " ", n, maybe "" ((" " <>) . pretty) t, " = ", pretty e]
-    Assign n e -> n <> " := " <> pretty e
-    Expr e -> pretty e
+    BindNode m n t e -> T.concat [pretty m, " ", n, maybe "" ((" " <>) . pretty) t, " = ", pretty e]
+    AssignNode n e -> n <> " := " <> pretty e
+    ExprNode e -> pretty e
 
 instance Show Stat where
   show = \case
-    Bind mut name typ expr ->
-      show mut <> " " <> T.unpack name <> maybe "" ((" " <>) . show) typ <> " = " <> show expr
+    Bind m name typ expr ->
+      show m <> " " <> T.unpack name <> maybe "" ((" " <>) . show) typ <> " = " <> show expr
     Assign name expr -> T.unpack name <> " := " <> show expr
     Expr expr -> show expr
 
+-- | A top-level declaration with the region of source it came from.  The
+--   type checker reports duplicates, which are found after elaboration has
+--   thrown the syntax away, so the position has to travel with the node.
 data TopLevelStat =
-  SFunctDef FunctDecl
-  | STypeDef Text [Text] {-[String]-} Typ
-  | SEffDef EffDef
-  | SRowDef RowDef
+  SFunctDef Span FunctDecl
+  | STypeDef Span Text [Text] {-[String]-} Typ
+  | SEffDef Span EffDef
+  | SRowDef Span RowDef
   deriving (Show, Generic)
 instance Sexp TopLevelStat where sexp = show
 
+-- | The position of a declaration, whatever its kind.
+topLevelSpan :: TopLevelStat -> Span
+topLevelSpan = \case
+  SFunctDef s _ -> s
+  STypeDef s _ _ _ -> s
+  SEffDef s _ -> s
+  SRowDef s _ -> s
+
 instance Pretty TopLevelStat where
   pretty = \case
-    SFunctDef f -> pretty f
-    SRowDef r -> pretty r
-    SEffDef e -> pretty e
+    SFunctDef _ f -> pretty f
+    SRowDef _ r -> pretty r
+    SEffDef _ e -> pretty e
     s -> T.pack $ show s
 
 data FunctDecl = FunctDecl {

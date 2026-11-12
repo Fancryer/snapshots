@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -20,6 +21,9 @@ module Scope (
   addType,
   addEffect,
   addHandler,
+  bindingNames,
+  typeNames,
+  effectNames,
   globalScope
 )
 where
@@ -35,10 +39,12 @@ import Types (
     EffRow(RClosed, RVar, ROpen),
     Scheme(Scheme),
     pureFunct,
-    Expr(..), NativeLambdaSign (..), tfunc, monoScheme
+    Expr(..), NativeLambdaSign (..), tfunc, monoScheme,
+    pattern NLambda, pattern Array, pattern String
   )
 import TypedIR (Scope(..))
 import qualified Data.Map as Map
+import Data.Map (Map)
 import Control.Monad.Except (Except, throwError)
 import Unify (TypeCheckM, TypeCheckError (SameScopeBindingShadowing), freshBoundM, freshMetaM, throwTypeCheckError)
 import qualified Data.Maybe as Maybe
@@ -126,6 +132,31 @@ hasEff uptop scope name = Maybe.isJust $ findEff uptop scope name
 
 hasHandler :: Bool -> Scope -> Bool
 hasHandler uptop scope = Maybe.isJust $ findHandler uptop scope
+
+-- | All value names visible from here, nearest scope first and without
+--   duplicates.  This is what a "did you mean?" suggestion searches: a name
+--   bound in an inner scope must not be suggested twice, and it must win over
+--   an outer binding of the same name.
+bindingNames :: Scope -> [Text]
+bindingNames = namesOf values
+
+-- | All type names visible from here, for a suggestion about a type.
+typeNames :: Scope -> [Text]
+typeNames = namesOf types
+
+-- | All effect names visible from here.
+effectNames :: Scope -> [Text]
+effectNames = namesOf effects
+
+-- | The keys of one of the three maps, walking the chain of enclosing scopes
+--   and keeping the first occurrence of every name.
+namesOf :: (Scope -> Map.Map Text a) -> Scope -> [Text]
+namesOf field = go
+  where
+    go scope =
+      let here = Map.keys (field scope)
+          outer = maybe [] go scope.parent
+      in here <> filter (`notElem` here) outer
 
 addBinding :: Text -> TypeScheme -> Expr -> Mutability -> Scope -> TypeCheckM Scope
 addBinding name typ expr mut scope =

@@ -4,12 +4,24 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE OrPatterns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE PatternSynonyms #-}
 
 module TypedIR(
   TypedExpr(..),
+  TypedExprNode(..),
+  pattern TEInt, pattern TEFloat, pattern TEBoolean, pattern TEString,
+  pattern TENil, pattern TEXVar, pattern TEArray, pattern TEPair,
+  pattern TEXLambda, pattern TENLambda, pattern TEApply, pattern TERecord,
+  pattern TEHandle, pattern TEParen, pattern TEResume, pattern TELet,
+  pattern TEPropAccess, pattern TEIfElse,
+  atTypedSpan,
+  teSpan,
   Block,
   Lambda(..),
   Stat(..),
+  StatNode(..),
+  pattern Bind, pattern Rebind, pattern Expr,
+  atTypedStatSpan, tStatSpan, blockSpan,
   FunctDecl(..),
   Handler(..),
   Scope(..),
@@ -23,6 +35,7 @@ module TypedIR(
 where
 import Types (
     Typ(..),
+    EffRow(..),
     ECons(..),
     Expr,
     Taste,
@@ -47,6 +60,7 @@ import Utils (Pretty (..), TextMap)
 import Data.Map (Map)
 import Data.List (find)
 import Resume (ResumeInfo)
+import Span (Span, noSpan, mergeSpan, mergeSpans)
 import Data.Set (Set)
 
 type TypeScope  = TextMap Typ
@@ -76,25 +90,114 @@ data Scope = Scope {
   parent        :: Maybe Scope
 } deriving (Show)
 
-data TypedExpr =
-  TEInt Integer
-  | TEFloat Scientific
-  | TEBoolean Bool
-  | TEString Text
-  | TENil
-  | TEXVar Text Typ
-  | TEArray Typ [TypedExpr]
-  | TEPair TypedExpr TypedExpr
-  | TEXLambda Lambda
-  | TENLambda NativeLambdaSign
-  | TEApply TypedExpr TypedExpr
-  | TERecord (Maybe TypedExpr) [TERecordProp]
-  | TEHandle Handler Typ
-  | TEParen Block
-  | TEResume TypedExpr Typ
-  | TELet LetPattern TypedExpr TypedExpr
-  | TEPropAccess TypedExpr Text
-  | TEIfElse TypedExpr TypedExpr TypedExpr
+data TypedExpr = MkTypedExpr {
+    teSpan :: Span
+  , teNode :: TypedExprNode
+  }
+
+-- | The shape of a typed expression, without its position.
+data TypedExprNode =
+    TEIntNode Integer
+  | TEFloatNode Scientific
+  | TEBooleanNode Bool
+  | TEStringNode Text
+  | TENilNode
+  | TEXVarNode Text Typ
+  | TEArrayNode Typ [TypedExpr]
+  | TEPairNode TypedExpr TypedExpr
+  | TEXLambdaNode Lambda
+  | TENLambdaNode NativeLambdaSign
+  | TEApplyNode TypedExpr TypedExpr
+  | TERecordNode (Maybe TypedExpr) [TERecordProp]
+  | TEHandleNode Handler Typ
+  | TEParenNode Block
+  | TEResumeNode TypedExpr Typ
+  | TELetNode LetPattern TypedExpr TypedExpr
+  | TEPropAccessNode TypedExpr Text
+  | TEIfElseNode TypedExpr TypedExpr TypedExpr
+  deriving (Show)
+
+pattern TEInt :: Integer -> TypedExpr
+pattern TEInt i <- MkTypedExpr _ (TEIntNode i) where
+  TEInt i = MkTypedExpr noSpan (TEIntNode i)
+
+pattern TEFloat :: Scientific -> TypedExpr
+pattern TEFloat f <- MkTypedExpr _ (TEFloatNode f) where
+  TEFloat f = MkTypedExpr noSpan (TEFloatNode f)
+
+pattern TEBoolean :: Bool -> TypedExpr
+pattern TEBoolean b <- MkTypedExpr _ (TEBooleanNode b) where
+  TEBoolean b = MkTypedExpr noSpan (TEBooleanNode b)
+
+pattern TEString :: Text -> TypedExpr
+pattern TEString s <- MkTypedExpr _ (TEStringNode s) where
+  TEString s = MkTypedExpr noSpan (TEStringNode s)
+
+pattern TENil :: TypedExpr
+pattern TENil <- MkTypedExpr _ TENilNode where
+  TENil = MkTypedExpr noSpan TENilNode
+
+pattern TEXVar :: Text -> Typ -> TypedExpr
+pattern TEXVar n t <- MkTypedExpr _ (TEXVarNode n t) where
+  TEXVar n t = MkTypedExpr noSpan (TEXVarNode n t)
+
+pattern TEArray :: Typ -> [TypedExpr] -> TypedExpr
+pattern TEArray t es <- MkTypedExpr _ (TEArrayNode t es) where
+  TEArray t es = MkTypedExpr noSpan (TEArrayNode t es)
+
+pattern TEPair :: TypedExpr -> TypedExpr -> TypedExpr
+pattern TEPair l r <- MkTypedExpr _ (TEPairNode l r) where
+  TEPair l r = MkTypedExpr (mergeSpan (teSpan l) (teSpan r)) (TEPairNode l r)
+
+pattern TEXLambda :: Lambda -> TypedExpr
+pattern TEXLambda l <- MkTypedExpr _ (TEXLambdaNode l) where
+  TEXLambda l = MkTypedExpr noSpan (TEXLambdaNode l)
+
+pattern TENLambda :: NativeLambdaSign -> TypedExpr
+pattern TENLambda l <- MkTypedExpr _ (TENLambdaNode l) where
+  TENLambda l = MkTypedExpr noSpan (TENLambdaNode l)
+
+pattern TEApply :: TypedExpr -> TypedExpr -> TypedExpr
+pattern TEApply f x <- MkTypedExpr _ (TEApplyNode f x) where
+  TEApply f x = MkTypedExpr (mergeSpan (teSpan f) (teSpan x)) (TEApplyNode f x)
+
+pattern TERecord :: Maybe TypedExpr -> [TERecordProp] -> TypedExpr
+pattern TERecord a ps <- MkTypedExpr _ (TERecordNode a ps) where
+  TERecord a ps =
+    MkTypedExpr (mergeSpans (maybe [] (\x -> [teSpan x]) a <> map (teSpan . terExpr) ps)) (TERecordNode a ps)
+
+pattern TEHandle :: Handler -> Typ -> TypedExpr
+pattern TEHandle h t <- MkTypedExpr _ (TEHandleNode h t) where
+  TEHandle h t = MkTypedExpr noSpan (TEHandleNode h t)
+
+pattern TEParen :: Block -> TypedExpr
+pattern TEParen b <- MkTypedExpr _ (TEParenNode b) where
+  TEParen b = MkTypedExpr noSpan (TEParenNode b)
+
+pattern TEResume :: TypedExpr -> Typ -> TypedExpr
+pattern TEResume e t <- MkTypedExpr _ (TEResumeNode e t) where
+  TEResume e t = MkTypedExpr (teSpan e) (TEResumeNode e t)
+
+pattern TELet :: LetPattern -> TypedExpr -> TypedExpr -> TypedExpr
+pattern TELet p w b <- MkTypedExpr _ (TELetNode p w b) where
+  TELet p w b = MkTypedExpr (mergeSpan (teSpan w) (teSpan b)) (TELetNode p w b)
+
+pattern TEPropAccess :: TypedExpr -> Text -> TypedExpr
+pattern TEPropAccess e n <- MkTypedExpr _ (TEPropAccessNode e n) where
+  TEPropAccess e n = MkTypedExpr (teSpan e) (TEPropAccessNode e n)
+
+pattern TEIfElse :: TypedExpr -> TypedExpr -> TypedExpr -> TypedExpr
+pattern TEIfElse p t f <- MkTypedExpr _ (TEIfElseNode p t f) where
+  TEIfElse p t f =
+    MkTypedExpr (mergeSpan (teSpan p) (mergeSpan (teSpan t) (teSpan f))) (TEIfElseNode p t f)
+
+{-# COMPLETE TEInt, TEFloat, TEBoolean, TEString, TENil, TEXVar, TEArray
+   , TEPair, TEXLambda, TENLambda, TEApply, TERecord, TEHandle, TEParen
+   , TEResume, TELet, TEPropAccess, TEIfElse #-}
+
+-- | Move a typed expression to the given span.
+atTypedSpan :: Span -> TypedExpr -> TypedExpr
+atTypedSpan s e = e {teSpan = s}
 
 instance Show TypedExpr where
   show = \case
@@ -122,7 +225,7 @@ instance Pretty TypedExpr where
   pretty = \case
     TEInt i -> T.pack $ show i
     TEFloat f -> T.pack $ show f
-    TEBoolean b -> T.pack $ show b
+    TEBoolean b -> if b then "true" else "false"
     TEString s -> "'" <> s <> "'"
     TENil -> "()"
     TEXVar n _ -> n
@@ -178,12 +281,19 @@ instance Pretty Lambda where
       "{",
       if null ts then "" else " [" <> T.unwords (map pretty ts) <> "]",
       if null es then "" else " {" <> T.unwords (map pretty es) <> "}",
-      " (", pretty arg, " : ", pretty argT, ") : ",
-      pretty fxs, " ", pretty retT,
+      " (", pretty arg, " : ", pretty argT, ")",
+      case fxs of
+        RClosed [] -> " : "
+        _ -> " : " <> pretty fxs <> " ",
+      pretty retT,
       " = ", pretty block, "}"
     ]
 
 type Block = ([Stat], TypedExpr)
+
+-- | The region a block covers, derived from its parts.
+blockSpan :: Block -> Span
+blockSpan (stats, e) = mergeSpans (map tStatSpan stats <> [teSpan e])
 
 instance Pretty Block where
   pretty (stats, e) = T.concat [
@@ -192,17 +302,48 @@ instance Pretty Block where
       pretty e
     ]
 
-data Stat =
-  Bind Mutability Text TypedExpr
-  | Rebind Text TypedExpr
-  | Expr TypedExpr
+-- | A statement of the typed IR, with the source region it came from.
+data Stat = MkStat {
+    tStatSpan :: Span
+  , tStatNode :: StatNode
+  }
+
+-- | The shape of a typed statement, without its position.
+data StatNode =
+    BindNode Mutability Text TypedExpr
+  | RebindNode Text TypedExpr
+  | ExprNode TypedExpr
   deriving (Show)
 
+pattern Bind :: Mutability -> Text -> TypedExpr -> Stat
+pattern Bind m n e <- MkStat _ (BindNode m n e) where
+  Bind m n e = MkStat (teSpan e) (BindNode m n e)
+
+pattern Rebind :: Text -> TypedExpr -> Stat
+pattern Rebind n e <- MkStat _ (RebindNode n e) where
+  Rebind n e = MkStat (teSpan e) (RebindNode n e)
+
+pattern Expr :: TypedExpr -> Stat
+pattern Expr e <- MkStat _ (ExprNode e) where
+  Expr e = MkStat (teSpan e) (ExprNode e)
+
+{-# COMPLETE Bind, Rebind, Expr #-}
+
+-- | Move a statement to the given span.
+atTypedStatSpan :: Span -> Stat -> Stat
+atTypedStatSpan s st = st {tStatSpan = s}
+
+instance Show Stat where
+  show (MkStat _ n) = show n
+
 instance Pretty Stat where
+  pretty = pretty . tStatNode
+
+instance Pretty StatNode where
   pretty = \case
-    Bind m n e -> T.concat [pretty m, " ", n, " = ", pretty e]
-    Rebind n e -> n <> " := " <> pretty e
-    Expr e -> pretty e
+    BindNode m n e -> T.concat [pretty m, " ", n, " = ", pretty e]
+    RebindNode n e -> n <> " := " <> pretty e
+    ExprNode e -> pretty e
 
 data FunctDecl = FunctDecl {
     fName  :: Text,

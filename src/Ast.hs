@@ -3,10 +3,13 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Ast (
   Chunk(..),
   TopLevelStat(..),
+  topLevelSpan,
   EffectOp(..),
   FunctArg(..),
   Typ(..),
@@ -19,6 +22,11 @@ module Ast (
   BindDef(..),
   ConstantQualifier(..),
   BlockStat(..),
+  BlockStatNode(..),
+  pattern BExp,
+  pattern BBindDef,
+  pattern BAssign,
+  atBlockStatSpan,
   Assign(..),
   PathExp(..),
   LetPattern(..),
@@ -31,6 +39,22 @@ module Ast (
   RecordTypeArg(..),
   RecordTypeArgProp(..),
   Exp(..),
+  ExpNode(..),
+  -- Read-only views of 'ExpNode', for destructuring.
+  pattern EName,
+  pattern EApply,
+  pattern EDollar,
+  pattern ELiteral,
+  pattern EPair,
+  pattern ELet,
+  pattern EBacktick,
+  pattern EPropAccess,
+  pattern EIfThenElse,
+  pattern EUnder,
+  pattern EResume,
+  pattern EParen,
+  pattern EWith,
+  binExp,
   HandlerClause(..),
   Literal(..),
   Atom(..),
@@ -54,7 +78,8 @@ import Utils (Pretty (pretty))
 import qualified Data.Text as T
 import qualified Data.List as String
 import GHC.Generics (Generic)
-import Sexp (Sexp)
+import Sexp (Sexp(..))
+import Span (Span, noSpan, mergeSpan)
 
 newtype Chunk = Chunk [TopLevelStat] deriving (Eq, Show, Generic)
 instance Sexp Chunk
@@ -82,23 +107,34 @@ instance Monoid EffParams where mempty = EffParams mempty mempty
 instance Pretty EffParams where
   pretty (EffParams es rs) = T.concat ["{", T.unwords es, if null rs then "" else " | " <> T.unwords rs, "}"]
 
+-- | A top-level declaration together with the region it occupies.  Duplicates
+--   are reported by the type checker, which never sees the parser's positions
+--   otherwise, so the span travels with the declaration.
 data TopLevelStat =
-  TypeDef Text TypeParams {-EffParams-} Typ
-  | EffectDef Text TypeParams [EffectOp]
-  | RowDef Text EffRow
-  | FunctDef Text TypeParams EffParams [FunctArg] (Maybe EffRow) Typ Block
+  TypeDef Span Text TypeParams {-EffParams-} Typ
+  | EffectDef Span Text TypeParams [EffectOp]
+  | RowDef Span Text EffRow
+  | FunctDef Span Text TypeParams EffParams [FunctArg] (Maybe EffRow) Typ Block
   deriving (Eq, Show, Generic)
-instance Sexp TopLevelStat
+instance Sexp TopLevelStat where sexp = show
+
+-- | The position of a declaration, whatever its kind.
+topLevelSpan :: TopLevelStat -> Span
+topLevelSpan = \case
+  TypeDef s _ _ _ -> s
+  EffectDef s _ _ _ -> s
+  RowDef s _ _ -> s
+  FunctDef s _ _ _ _ _ _ _ -> s
 
 instance Pretty TopLevelStat where
   pretty = \case
-    TypeDef n ts {-es-} t ->
+    TypeDef _ n ts {-es-} t ->
       T.concat ["type ", n, prettyTs ts, {-, prettyEs es-} " = ", pretty t]
-    EffectDef n ts ops ->
+    EffectDef _ n ts ops ->
       T.concat ["effect ", n, prettyTs ts, " ", T.unwords $ map pretty ops, " end"]
-    RowDef n row ->
+    RowDef _ n row ->
       T.concat ["row ", n, " = ", pretty row]
-    FunctDef n ts es args fxs t b ->
+    FunctDef _ n ts es args fxs t b ->
       T.concat [
         "funct ",
         n,
@@ -238,18 +274,54 @@ instance Pretty ConstantQualifier where
     Val -> "val"
     Imm -> "imm"
 
-data BlockStat =
-  BExp Exp
-  | BBindDef BindDef
-  | BAssign Assign
+-- | A statement of a block, with the source region it came from.  Statements
+--   need their own position because the errors they raise (assigning to an
+--   immutable variable, shadowing a binding in the same scope) are about the
+--   statement, not about any subexpression.
+data BlockStat = BlockStat {
+    bsSpan :: Span
+  , bsNode :: BlockStatNode
+  } deriving (Eq, Generic)
+
+-- | The shape of a block statement, without its position.
+data BlockStatNode =
+  BExpNode Exp
+  | BBindDefNode BindDef
+  | BAssignNode Assign
   deriving (Eq, Show, Generic)
-instance Sexp BlockStat
+
+instance Sexp BlockStat where sexp = sexp . bsNode
+instance Sexp BlockStatNode
+
+pattern BExp :: Exp -> BlockStat
+pattern BExp e <- BlockStat _ (BExpNode e) where
+  BExp e = BlockStat (expSpan e) (BExpNode e)
+
+pattern BBindDef :: BindDef -> BlockStat
+pattern BBindDef b <- BlockStat _ (BBindDefNode b) where
+  BBindDef b@(BindDef _ _ e) = BlockStat (expSpan e) (BBindDefNode b)
+
+pattern BAssign :: Assign -> BlockStat
+pattern BAssign a <- BlockStat _ (BAssignNode a) where
+  BAssign a@(Assign _ e) = BlockStat (expSpan e) (BAssignNode a)
+
+{-# COMPLETE BExp, BBindDef, BAssign #-}
+
+instance Show BlockStat where
+  show (BlockStat _ n) = show n
+
+-- | Move a statement to the given span.
+atBlockStatSpan :: Span -> BlockStat -> BlockStat
+atBlockStatSpan s st = st {bsSpan = s}
 
 instance Pretty BlockStat where
+  pretty = pretty . bsNode
+
+instance Pretty BlockStatNode where
   pretty = \case
-    BExp e -> pretty e
-    BBindDef b -> pretty b
-    BAssign a -> pretty a
+    BExpNode e -> pretty e
+    BBindDefNode b -> pretty b
+    BAssignNode a -> pretty a
 
 data Assign = Assign Text Exp deriving (Eq, Show, Generic)
 instance Sexp Assign
@@ -358,39 +430,121 @@ instance Sexp RecordTypeArgProp
 instance Pretty RecordTypeArgProp where
   pretty (RecordTypeArgProp cq n t) = T.concat [pretty cq, " ", n, " : ", pretty t]
 
-data Exp =
-  EName Text
-  | EApply Exp Exp
-  | EDollar Exp Exp
-  | ELiteral Literal
-  | EPair Exp Exp
-  | ELet LetPattern Exp Exp
-  | EBacktick Text Exp Exp
-  | EPropAccess Exp Text
-  | EIfThenElse Exp Exp Exp
-  | EUnder Under
-  | EResume Exp
-  | EParen Block
-  | EWith Exp TypeApps EffApps
-  deriving (Eq, Show, Generic)
-instance Sexp Exp
+-- | An expression together with the region of source it came from.
+--
+--   Constructed by the parser with a real 'Span'; the elaborator only ever
+--   matches on it.  'noSpan' means \"unknown\" and every consumer must
+--   tolerate it.
+data Exp = Exp {
+    expSpan :: Span
+  , expNode :: ExpNode
+  } deriving (Eq, Show, Generic)
 
+-- | The shape of an expression, without its position.
+data ExpNode =
+    NName Text
+  | NApply Exp Exp
+  | NDollar Exp Exp
+  | NLiteral Literal
+  | NPair Exp Exp
+  | NLet LetPattern Exp Exp
+  | NBacktick Text Exp Exp
+  | NPropAccess Exp Text
+  | NIfThenElse Exp Exp Exp
+  | NUnder Under
+  | NResume Exp
+  | NParen Block
+  | NWith Exp TypeApps EffApps
+  deriving (Eq, Show, Generic)
+
+instance Sexp Exp where sexp = sexp . expNode
+instance Sexp ExpNode
+
+-- | The public constructors of 'ExpNode' as matchable patterns.
+--
+--   They are bidirectional, but the builder form attaches 'noSpan': only the
+--   parser has a position to give, and it overwrites the span of the finished
+--   node (see 'Parser.located').  'tests/SpanSpec.hs' checks that every node of
+--   every example program ends up with a real span, so a forgotten 'located'
+--   fails the suite instead of silently losing the position.
+pattern EName :: Text -> Exp
+pattern EName n <- Exp _ (NName n) where
+  EName n = Exp noSpan (NName n)
+
+pattern EApply :: Exp -> Exp -> Exp
+pattern EApply f x <- Exp _ (NApply f x) where
+  EApply f x = Exp (mergeSpan (expSpan f) (expSpan x)) (NApply f x)
+
+pattern EDollar :: Exp -> Exp -> Exp
+pattern EDollar f x <- Exp _ (NDollar f x) where
+  EDollar f x = Exp (mergeSpan (expSpan f) (expSpan x)) (NDollar f x)
+
+pattern ELiteral :: Literal -> Exp
+pattern ELiteral l <- Exp _ (NLiteral l) where
+  ELiteral l = Exp noSpan (NLiteral l)
+
+pattern EPair :: Exp -> Exp -> Exp
+pattern EPair l r <- Exp _ (NPair l r) where
+  EPair l r = Exp (mergeSpan (expSpan l) (expSpan r)) (NPair l r)
+
+pattern ELet :: LetPattern -> Exp -> Exp -> Exp
+pattern ELet p w b <- Exp _ (NLet p w b) where
+  ELet p w b = Exp (mergeSpan (expSpan w) (expSpan b)) (NLet p w b)
+
+pattern EBacktick :: Text -> Exp -> Exp -> Exp
+pattern EBacktick op l r <- Exp _ (NBacktick op l r) where
+  EBacktick op l r = Exp (mergeSpan (expSpan l) (expSpan r)) (NBacktick op l r)
+
+pattern EPropAccess :: Exp -> Text -> Exp
+pattern EPropAccess e n <- Exp _ (NPropAccess e n) where
+  EPropAccess e n = Exp (expSpan e) (NPropAccess e n)
+
+pattern EIfThenElse :: Exp -> Exp -> Exp -> Exp
+pattern EIfThenElse p t f <- Exp _ (NIfThenElse p t f) where
+  EIfThenElse p t f =
+    Exp (mergeSpan (expSpan p) (mergeSpan (expSpan t) (expSpan f))) (NIfThenElse p t f)
+
+pattern EUnder :: Under -> Exp
+pattern EUnder u <- Exp _ (NUnder u) where
+  EUnder u = Exp noSpan (NUnder u)
+
+pattern EResume :: Exp -> Exp
+pattern EResume e <- Exp _ (NResume e) where
+  EResume e = Exp (expSpan e) (NResume e)
+
+pattern EParen :: Block -> Exp
+pattern EParen b <- Exp _ (NParen b) where
+  EParen b = Exp noSpan (NParen b)
+
+pattern EWith :: Exp -> TypeApps -> EffApps -> Exp
+pattern EWith e ts es <- Exp _ (NWith e ts es) where
+  EWith e ts es = Exp (expSpan e) (NWith e ts es)
+
+{-# COMPLETE EName, EApply, EDollar, ELiteral, EPair, ELet, EBacktick
+   , EPropAccess, EIfThenElse, EUnder, EResume, EParen, EWith #-}
+
+-- | A node covering both children.
+binExp :: (Exp -> Exp -> ExpNode) -> Exp -> Exp -> Exp
+binExp f l r = Exp (mergeSpan (expSpan l) (expSpan r)) (f l r)
 
 instance Pretty Exp where
+  pretty (Exp _ n) = pretty n
+
+instance Pretty ExpNode where
   pretty = \case
-    EName n -> n
-    EApply c e -> T.concat [pretty c, " ", pretty e]
-    EDollar c e -> T.concat [pretty c, " $ ", pretty e]
-    ELiteral l -> pretty l
-    EPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
-    ELet p w e -> T.concat ["let ", pretty p, " = ", pretty w, " in ", pretty e]
-    EBacktick op l r -> T.concat [pretty l, "`", op, "`", pretty r]
-    EPropAccess e n -> T.concat [pretty e, "@", n]
-    EIfThenElse p t f -> T.concat ["if ", pretty p, " then ", pretty t, " else ", pretty f]
-    EUnder u -> pretty u
-    EResume e -> T.append "resume " $ pretty e
-    EParen b -> T.concat ["(", pretty b, ")"]
-    EWith e tas eas -> T.concat [pretty e, " with ", pretty tas, pretty eas]
+    NName n -> n
+    NApply c e -> T.concat [pretty c, " ", pretty e]
+    NDollar c e -> T.concat [pretty c, " $ ", pretty e]
+    NLiteral l -> pretty l
+    NPair l r -> T.concat ["(", pretty l, ", ", pretty r, ")"]
+    NLet p w e -> T.concat ["let ", pretty p, " = ", pretty w, " in ", pretty e]
+    NBacktick op l r -> T.concat [pretty l, "`", op, "`", pretty r]
+    NPropAccess e n -> T.concat [pretty e, "@", n]
+    NIfThenElse p t f -> T.concat ["if ", pretty p, " then ", pretty t, " else ", pretty f]
+    NUnder u -> pretty u
+    NResume e -> T.append "resume " $ pretty e
+    NParen b -> T.concat ["(", pretty b, ")"]
+    NWith e tas eas -> T.concat [pretty e, " with ", pretty tas, pretty eas]
 
 data ExpPrecedence =
   PrecResume
